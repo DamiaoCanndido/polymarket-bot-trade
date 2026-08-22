@@ -435,6 +435,32 @@ def api_traders_toggle():
     return jsonify({"success": False, "message": "Trader not found"}), 404
 
 
+@app.route("/api/traders/scan", methods=["POST"])
+def api_traders_scan():
+    data = request.get_json(silent=True) or {}
+    period = data.get("period", "7d")
+    top_n = int(data.get("top", 25))
+    cfg = load_config()
+    try:
+        from scanner import LeaderboardScanner
+        scanner = LeaderboardScanner(bullpen_path=cfg.bullpen_path)
+        traders = scanner.fetch_top_traders(time_period=period, limit=100)
+        if traders:
+            cfg.traders = traders[:top_n]
+            save_config(cfg)
+            bot_manager.reload_config()
+            bot_manager.log_activity("info", f"🎯 Escaneou e atualizou os top {len(cfg.traders)} master traders ({period}).")
+            return jsonify({
+                "success": True,
+                "count": len(cfg.traders),
+                "message": f"Atualizado com sucesso com os top {len(cfg.traders)} traders ({period})!",
+                "traders": [t.__dict__ for t in cfg.traders]
+            })
+        return jsonify({"success": False, "message": "Nenhum trader encontrado com os filtros atuais."}), 404
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/config/update", methods=["POST"])
 def api_config_update():
     data = request.get_json(silent=True) or {}
@@ -876,6 +902,28 @@ DASHBOARD_HTML = """
 
     <!-- TAB 3: TOP 25 MASTER TRADERS -->
     <div id="tab-content-traders" class="hidden space-y-4">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-gray-900/60 p-4 rounded-xl border border-bordercol">
+        <div>
+          <h3 class="text-sm font-bold text-white flex items-center gap-2">
+            <span>👥</span> Gerenciamento de Master Traders
+          </h3>
+          <p class="text-xs text-gray-400 mt-0.5">
+            Traders ativos salvos no <span class="font-mono text-cyan-400">config.json</span>. Você pode ativar/pausar individualmente ou escanear o ranking da Polymarket.
+          </p>
+        </div>
+        <div class="flex items-center gap-2">
+          <select id="scan-period-select" class="bg-gray-800 border border-gray-700 text-gray-200 text-xs rounded-lg px-3 py-1.5 focus:outline-none focus:border-cyan-500">
+            <option value="7d">Últimos 7 Dias (7D)</option>
+            <option value="30d">Últimos 30 Dias (30D)</option>
+            <option value="all">Todo o Período (All-Time)</option>
+          </select>
+          <button onclick="scanTradersFromDashboard()" id="btn-scan-traders" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-cyan-600 hover:bg-cyan-500 text-white flex items-center gap-1.5 shadow-lg shadow-cyan-900/30 transition">
+            <span id="scan-spinner" class="hidden">⏳</span>
+            <span>🔄 Escanear & Atualizar Top 25</span>
+          </button>
+        </div>
+      </div>
+
       <div class="glass-card rounded-xl overflow-hidden border border-bordercol">
         <div class="overflow-x-auto">
           <table class="w-full text-left text-xs">
@@ -1436,6 +1484,40 @@ DASHBOARD_HTML = """
         }).join('');
       } catch (e) {
         console.error('Error loading traders:', e);
+      }
+    }
+
+    // Scan & Update Master Traders directly from Dashboard
+    async function scanTradersFromDashboard() {
+      const btn = document.getElementById('btn-scan-traders');
+      const spinner = document.getElementById('scan-spinner');
+      const periodSelect = document.getElementById('scan-period-select');
+      const period = periodSelect ? periodSelect.value : '7d';
+
+      if (btn) btn.disabled = true;
+      if (spinner) spinner.classList.remove('hidden');
+
+      showToast('Escaneando Polymarket', `Buscando e filtrando os melhores traders (${period})...`, 'info', 4000);
+
+      try {
+        const res = await fetch('/api/traders/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ period: period, top: 25 })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast('Sucesso', data.message || 'Lista de traders atualizada!', 'success', 3500);
+          await loadTraders();
+          await refreshAllData();
+        } else {
+          showToast('Erro ao escanear', data.error || data.message || 'Falha ao buscar traders', 'error', 4000);
+        }
+      } catch (err) {
+        showToast('Erro de Conexão', err.message, 'error', 4000);
+      } finally {
+        if (btn) btn.disabled = false;
+        if (spinner) spinner.classList.add('hidden');
       }
     }
 
