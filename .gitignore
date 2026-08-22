@@ -1,0 +1,81 @@
+# ==============================================================================
+# Git Ignore - Polymarket Copytrading Bot
+# ==============================================================================
+
+# Environment & Secret Variables
+.env
+.env.local
+.env.*.local
+*.env
+!.env.example
+
+# Private Keys & Credentials
+*.pem
+*.key
+*.pkcs12
+*.pfx
+*.keystore
+*.secret
+credentials.json
+secrets.json
+
+# Local Runtime Data, Logs & Portfolio States
+trades_log.jsonl
+portfolio_state.json
+*.log
+*.sqlite3
+*.db
+
+# Python Virtual Environments & Packages
+.venv/
+venv/
+ENV/
+env/
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Byte-compiled / Optimized Python Files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE & Editor Configs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS Specific Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Bullpen CLI & Local Agent Caches
+.bullpen/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
