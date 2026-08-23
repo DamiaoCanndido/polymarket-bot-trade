@@ -203,11 +203,14 @@ class CopyTracker:
         tx_hash = trade.get("transaction_hash") or ""
         trade_time = trade.get("timestamp") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
+        market_url = f"https://polymarket.com/event/{market_slug}" if market_slug else ""
+
         return {
             "trade_id": str(trade_id),
             "transaction_hash": str(tx_hash),
             "market_slug": market_slug,
             "market_title": market_title,
+            "market_url": market_url,
             "outcome": outcome,
             "side": side,
             "price": price,
@@ -240,6 +243,7 @@ class CopyTracker:
 
         market_slug = extracted["market_slug"]
         market_title = extracted["market_title"]
+        market_url = extracted["market_url"]
         outcome = extracted["outcome"]
         side = extracted["side"]
         price = extracted["price"]
@@ -251,7 +255,7 @@ class CopyTracker:
         timestamp_now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
         logger.info(
-            f"⚡ New Signal [{mode.upper()}]: {side} {outcome} on '{market_slug}' by {trader_info.name} "
+            f"⚡ New Signal [{mode.upper()}]: {side} {outcome} on '{market_url or market_slug}' by {trader_info.name} "
             f"(${master_size_usd:,.2f} @ ${price:.3f})"
         )
 
@@ -271,6 +275,7 @@ class CopyTracker:
             "market": {
                 "slug": market_slug,
                 "title": market_title,
+                "url": market_url,
                 "outcome": outcome
             },
             "master_trade": {
@@ -340,11 +345,13 @@ class CopyTracker:
                     pos = mode_port["positions"].get(pos_key, {
                         "market_slug": market_slug,
                         "market_title": market_title,
+                        "market_url": market_url,
                         "outcome": outcome,
                         "shares": 0.0,
                         "total_cost": 0.0,
                         "avg_price": price
                     })
+                    pos["market_url"] = market_url
                     pos["shares"] += bot_shares
                     pos["total_cost"] += approved_usd
                     pos["avg_price"] = pos["total_cost"] / pos["shares"] if pos["shares"] > 0 else price
@@ -375,11 +382,13 @@ class CopyTracker:
                     pos = mode_port["positions"].get(pos_key, {
                         "market_slug": market_slug,
                         "market_title": market_title,
+                        "market_url": market_url,
                         "outcome": outcome,
                         "shares": 0.0,
                         "total_cost": 0.0,
                         "avg_price": price
                     })
+                    pos["market_url"] = market_url
                     pos["shares"] += bot_shares
                     pos["total_cost"] += approved_usd
                     pos["avg_price"] = pos["total_cost"] / pos["shares"] if pos["shares"] > 0 else price

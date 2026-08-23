@@ -175,15 +175,17 @@ def cmd_portfolio(args, config: BotConfig):
             continue
 
         table = Table(title=f"Posições Abertas ({m.upper()})", border_style=m_color)
-        table.add_column("Mercado (Slug)", style="cyan")
+        table.add_column("URL Polymarket", style="cyan")
         table.add_column("Desfecho", style="bold yellow")
         table.add_column("Cotas", justify="right", style="magenta")
         table.add_column("Preço Médio", justify="right", style="yellow")
         table.add_column("Custo Total", justify="right", style="green")
 
         for key, pos in positions.items():
+            p_slug = pos.get("market_slug", key.split(":")[0])
+            p_url = pos.get("market_url") or (f"https://polymarket.com/event/{p_slug}" if p_slug else "-")
             table.add_row(
-                pos.get("market_slug", key),
+                p_url,
                 pos.get("outcome", "Yes"),
                 f"{pos.get('shares', 0):,.2f}",
                 f"${pos.get('avg_price', 0):.3f}",
@@ -220,7 +222,7 @@ def cmd_logs(args, config: BotConfig):
     table.add_column("Modo", style="bold")
     table.add_column("Master", style="bold white")
     table.add_column("Ação", style="bold")
-    table.add_column("Mercado", style="cyan")
+    table.add_column("URL Polymarket", style="cyan")
     table.add_column("Desfecho", style="yellow")
     table.add_column("Tamanho Mestre", justify="right")
     table.add_column("Copiado", justify="right", style="green")
@@ -243,12 +245,15 @@ def cmd_logs(args, config: BotConfig):
         status_color = "green" if status == "EXECUTED" else ("yellow" if status in ("SKIPPED", "REJECTED_BY_RISK") else "red")
         status_str = f"[{status_color}]{status}[/{status_color}]"
 
+        m_slug = market.get("slug", "")
+        m_url = market.get("url") or (f"https://polymarket.com/event/{m_slug}" if m_slug else "-")
+
         table.add_row(
             rec.get("timestamp", "")[:19].replace("T", " "),
             mode_str,
             master.get("name") or (master.get("address", "")[:8] if master.get("address") else "Unknown"),
             action_str,
-            market.get("slug", "")[:28],
+            m_url,
             market.get("outcome", ""),
             f"${m_trade.get('size_usd', 0):,.2f}",
             f"${b_exec.get('amount_usd', 0):,.2f}",
@@ -292,19 +297,22 @@ def cmd_start(args, config: BotConfig):
                     b_exec = details.get("bot_execution", {})
                     master = details.get("master_trader", {})
 
+                    m_slug = market.get("slug", "")
+                    m_url = market.get("url") or (f"https://polymarket.com/event/{m_slug}" if m_slug else "")
+
                     status = b_exec.get("status", "EXECUTED")
                     if status == "EXECUTED":
                         action = b_exec.get("action", "BUY")
                         action_color = "green" if action == "BUY" else "magenta"
                         console.print(
                             f"[{action_color}]✓ {action} EXECUTED:[/{action_color}] "
-                            f"Outcome: [bold yellow]{market.get('outcome')}[/bold yellow] on [cyan]{market.get('slug')}[/cyan] | "
+                            f"Outcome: [bold yellow]{market.get('outcome')}[/bold yellow] on [cyan]{m_url or m_slug}[/cyan] | "
                             f"Copied: [green]${b_exec.get('amount_usd', 0):.2f}[/green] ({b_exec.get('shares', 0):.2f} shs @ ${b_exec.get('price', 0):.3f}) | "
                             f"Master: [bold white]{master.get('name')}[/bold white] (${m_trade.get('size_usd', 0):,.2f})"
                         )
                     elif status == "FAILED":
                         console.print(
-                            f"[red]✗ TRADE FAILED:[/red] {market.get('slug')} ({market.get('outcome')}) | "
+                            f"[red]✗ TRADE FAILED:[/red] {m_url or m_slug} ({market.get('outcome')}) | "
                             f"Error: {b_exec.get('reason')} (Continuing loop...)"
                         )
 

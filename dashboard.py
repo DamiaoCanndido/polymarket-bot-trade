@@ -998,7 +998,7 @@ DASHBOARD_HTML = """
                 <th class="px-4 py-3 text-center">Modo</th>
                 <th class="px-4 py-3">Master Trader</th>
                 <th class="px-4 py-3">Ação</th>
-                <th class="px-4 py-3">Mercado / Evento</th>
+                <th class="px-4 py-3">Mercado / URL Polymarket</th>
                 <th class="px-4 py-3">Desfecho</th>
                 <th class="px-4 py-3 text-right">Tamanho Mestre</th>
                 <th class="px-4 py-3 text-right">Copiado</th>
@@ -1037,7 +1037,7 @@ DASHBOARD_HTML = """
           <table class="w-full text-left text-xs">
             <thead class="bg-gray-900/90 text-gray-400 border-b border-bordercol uppercase tracking-wider font-semibold">
               <tr>
-                <th class="px-4 py-3">Mercado / Evento</th>
+                <th class="px-4 py-3">Mercado / URL Polymarket</th>
                 <th class="px-4 py-3">Desfecho</th>
                 <th class="px-4 py-3 text-right">Cotas Detidas</th>
                 <th class="px-4 py-3 text-right">Preço Médio</th>
@@ -1627,6 +1627,8 @@ DASHBOARD_HTML = """
         const botAmt = (b_exec.amount_usd || 0).toFixed(2);
         const price = (b_exec.price || m_trade.price || 0.5).toFixed(3);
         const reasonStr = b_exec.reason || t.error || '-';
+        const marketSlug = market.slug || '';
+        const marketUrl = market.url || (marketSlug ? `https://polymarket.com/event/${marketSlug}` : '');
 
         return `
           <tr class="hover:bg-gray-900/50 transition">
@@ -1634,7 +1636,15 @@ DASHBOARD_HTML = """
             <td class="px-4 py-3 text-center whitespace-nowrap">${modeBadge}</td>
             <td class="px-4 py-3 font-semibold text-white whitespace-nowrap">${masterName}</td>
             <td class="px-4 py-3 whitespace-nowrap">${actionBadge}</td>
-            <td class="px-4 py-3 font-mono text-cyan-400 truncate max-w-xs" title="${market.slug || ''}">${market.slug || '-'}</td>
+            <td class="px-4 py-3 font-mono">
+              ${marketUrl ? `
+                <a href="${marketUrl}" target="_blank" rel="noopener noreferrer" class="text-cyan-400 hover:text-cyan-300 underline font-mono inline-flex items-center gap-1 max-w-[280px] truncate group" title="Abrir: ${marketUrl}">
+                  <span class="truncate">${marketUrl}</span>
+                  <svg class="w-3 h-3 flex-shrink-0 text-cyan-500 group-hover:text-cyan-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                </a>
+              ` : '<span class="text-gray-500">-</span>'}
+              ${market.title ? `<span class="text-gray-400 text-[11px] block truncate max-w-[280px] mt-0.5">${market.title}</span>` : ''}
+            </td>
             <td class="px-4 py-3 font-bold text-yellow-400 whitespace-nowrap">${market.outcome || '-'}</td>
             <td class="px-4 py-3 text-right text-gray-300 font-mono">$${mSize}</td>
             <td class="px-4 py-3 text-right font-bold text-green-400 font-mono">$${botAmt}</td>
@@ -1666,10 +1676,18 @@ DASHBOARD_HTML = """
         tbody.innerHTML = keys.map(k => {
           const p = positions[k];
           const val = (p.shares || 0) * (p.avg_price || 0.5);
+          const pSlug = p.market_slug || k.split(':')[0] || '';
+          const pUrl = p.market_url || (pSlug ? `https://polymarket.com/event/${pSlug}` : '');
+
           return `
             <tr class="hover:bg-gray-900/50 transition">
               <td class="px-4 py-3 font-semibold text-white">
-                <span class="text-cyan-400 font-mono">${p.market_slug || k}</span>
+                ${pUrl ? `
+                  <a href="${pUrl}" target="_blank" rel="noopener noreferrer" class="text-cyan-400 hover:text-cyan-300 underline font-mono inline-flex items-center gap-1 max-w-[320px] truncate group" title="Abrir: ${pUrl}">
+                    <span class="truncate">${pUrl}</span>
+                    <svg class="w-3 h-3 flex-shrink-0 text-cyan-500 group-hover:text-cyan-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                  </a>
+                ` : `<span class="text-cyan-400 font-mono">${pSlug || k}</span>`}
                 ${p.market_title ? `<br><span class="text-gray-400 text-[11px]">${p.market_title}</span>` : ''}
               </td>
               <td class="px-4 py-3 font-bold text-yellow-400">${p.outcome || '-'}</td>
