@@ -28,11 +28,14 @@ class CopyTracker:
         self.portfolio_state_file = config.portfolio_state_file
         self.processed_trade_ids: Set[str] = set()
 
-        # Track master trader holdings for calculating sell proportions:
-        # master_address -> { market_slug:outcome -> shares_held }
-        self.master_positions: Dict[str, Dict[str, float]] = {}
+        # Track master trader holdings separately for paper and live modes:
+        # mode -> master_address -> { market_slug:outcome -> shares_held }
+        self.master_positions: Dict[str, Dict[str, Dict[str, float]]] = {
+            "paper": {},
+            "live": {}
+        }
 
-        # Bot portfolio state (both for paper mode and tracking mirror execution)
+        # Bot portfolio state separated into "paper" and "live"
         self.portfolio: Dict[str, Any] = self._load_or_init_portfolio()
 
         # Bot startup timestamp
@@ -40,46 +43,105 @@ class CopyTracker:
         self.start_timestamp_str = self.start_time.strftime("%Y-%m-%d %H:%M:%S UTC")
         self._seeded = False
 
-    def _load_or_init_portfolio(self) -> Dict[str, Any]:
-        """
-        Loads existing portfolio state from file if available, or initializes new state.
-        """
-        if os.path.exists(self.portfolio_state_file):
-            try:
-                with open(self.portfolio_state_file, "r") as f:
-                    state = json.load(f)
-                    logger.info(f"Loaded existing portfolio state: ${state.get('cash_usd', 1000.0):.2f} cash, {len(state.get('positions', {}))} open positions")
-                    return state
-            except Exception as e:
-                logger.warning(f"Could not load portfolio state file ({e}), initializing default.")
-
+    def _default_mode_state(self, initial_cash: float = 1000.0) -> Dict[str, Any]:
         return {
-            "initial_cash_usd": 1000.0,
-            "cash_usd": 1000.0,
+            "initial_cash_usd": float(initial_cash),
+            "cash_usd": float(initial_cash),
             "realized_pnl_usd": 0.0,
             "total_trades_count": 0,
             "successful_trades": 0,
             "failed_trades": 0,
             "skipped_trades": 0,
             "positions": {},  # "market_slug:outcome" -> {"market_slug": ..., "outcome": ..., "shares": ..., "total_cost": ..., "avg_price": ...}
+            "positions_value_usd": 0.0,
+            "total_equity_usd": float(initial_cash),
+            "open_positions_count": 0,
+            "last_updated": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+
+    def _load_or_init_portfolio(self) -> Dict[str, Any]:
+        """
+        Loads existing portfolio state from file if available, or initializes new state.
+        Migrates legacy flat portfolio files into separated "paper" and "live" states.
+        """
+        if os.path.exists(self.portfolio_state_file):
+            try:
+                with open(self.portfolio_state_file, "r") as f:
+                    state = json.load(f)
+
+                    # Check if already in separated format
+                    if isinstance(state, dict) and "paper" in state and "live" in state:
+                        logger.info(
+                            f"Loaded separated portfolio state | "
+                            f"Paper: ${state['paper'].get('cash_usd', 1000.0):.2f} ({len(state['paper'].get('positions', {}))} pos) | "
+                            f"Live: ${state['live'].get('cash_usd', 0.0):.2f} ({len(state['live'].get('positions', {}))} pos)"
+                        )
+                        return state
+
+                    # Legacy format detected: migrate flat dict into paper state
+                    logger.info("Migrating legacy portfolio state to separated paper/live schema...")
+                    paper_state = {
+                        "initial_cash_usd": float(state.get("initial_cash_usd", self.config.paper_initial_cash_usd)),
+                        "cash_usd": float(state.get("cash_usd", self.config.paper_initial_cash_usd)),
+                        "realized_pnl_usd": float(state.get("realized_pnl_usd", 0.0)),
+                        "total_trades_count": int(state.get("successful_trades", 0)),
+                        "successful_trades": int(state.get("successful_trades", 0)),
+                        "failed_trades": 0,
+                        "skipped_trades": int(state.get("skipped_trades", 0)),
+                        "positions": state.get("positions", {}),
+                        "positions_value_usd": float(state.get("positions_value_usd", 0.0)),
+                        "total_equity_usd": float(state.get("total_equity_usd", 1000.0)),
+                        "open_positions_count": len(state.get("positions", {})),
+                        "last_updated": state.get("last_updated", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"))
+                    }
+
+                    # Live state initialized clean
+                    live_state = self._default_mode_state(self.config.live_initial_cash_usd)
+
+                    migrated = {
+                        "paper": paper_state,
+                        "live": live_state,
+                        "last_updated": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                    }
+
+                    # Persist migrated state immediately
+                    with open(self.portfolio_state_file, "w") as out_f:
+                        json.dump(migrated, out_f, indent=2)
+
+                    return migrated
+            except Exception as e:
+                logger.warning(f"Could not load portfolio state file ({e}), initializing default.")
+
+        return {
+            "paper": self._default_mode_state(self.config.paper_initial_cash_usd),
+            "live": self._default_mode_state(self.config.live_initial_cash_usd),
             "last_updated": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         }
 
     def _save_portfolio_state(self) -> None:
         """
-        Persists current portfolio metrics and open positions to portfolio_state.json.
+        Persists current portfolio metrics and open positions for both paper and live modes to portfolio_state.json.
         """
         try:
-            self.portfolio["last_updated"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-            
-            # Calculate open positions value estimate
-            pos_val = 0.0
-            for pos in self.portfolio.get("positions", {}).values():
-                pos_val += pos.get("shares", 0.0) * pos.get("avg_price", 0.50)
+            now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            self.portfolio["last_updated"] = now_str
 
-            self.portfolio["positions_value_usd"] = pos_val
-            self.portfolio["total_equity_usd"] = self.portfolio.get("cash_usd", 0.0) + pos_val
-            self.portfolio["open_positions_count"] = len(self.portfolio.get("positions", {}))
+            for mode in ("paper", "live"):
+                if mode not in self.portfolio:
+                    self.portfolio[mode] = self._default_mode_state(
+                        self.config.paper_initial_cash_usd if mode == "paper" else self.config.live_initial_cash_usd
+                    )
+                mode_port = self.portfolio[mode]
+                mode_port["last_updated"] = now_str
+
+                # Calculate open positions value estimate
+                pos_val = 0.0
+                for pos in mode_port.get("positions", {}).values():
+                    pos_val += float(pos.get("shares", 0.0)) * float(pos.get("avg_price", 0.50))
+
+                mode_port["positions_value_usd"] = round(pos_val, 2)
+                mode_port["total_equity_usd"] = round(float(mode_port.get("cash_usd", 0.0)) + pos_val, 2)
+                mode_port["open_positions_count"] = len(mode_port.get("positions", {}))
 
             with open(self.portfolio_state_file, "w") as f:
                 json.dump(self.portfolio, f, indent=2)
@@ -158,10 +220,11 @@ class CopyTracker:
         """
         Processes a single incoming trade event:
         1. Extracts market slug, outcome, amount
-        2. If BUY -> Buys according to sizing & risk
-        3. If SELL -> Sells proportionally IF we hold open position; otherwise skips safely
-        4. Logs full details to trades_log.jsonl
-        5. Updates portfolio state
+        2. Determines execution mode (Paper vs Live)
+        3. If BUY -> Buys according to sizing & risk in mode's portfolio
+        4. If SELL -> Sells proportionally IF we hold open position in mode; otherwise skips safely
+        5. Logs full details to trades_log.jsonl with mode-isolated metrics
+        6. Updates portfolio state
         """
         extracted = self.extract_trade_details(trade)
         trade_id = extracted["trade_id"]
@@ -170,6 +233,10 @@ class CopyTracker:
             return {"status": "SKIPPED", "reason": "already processed"}
 
         self.processed_trade_ids.add(trade_id)
+
+        mode = "paper" if self.config.dry_run else "live"
+        mode_port = self.portfolio[mode]
+        master_pos_map = self.master_positions[mode]
 
         market_slug = extracted["market_slug"]
         market_title = extracted["market_title"]
@@ -184,7 +251,7 @@ class CopyTracker:
         timestamp_now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
         logger.info(
-            f"⚡ New Signal: {side} {outcome} on '{market_slug}' by {trader_info.name} "
+            f"⚡ New Signal [{mode.upper()}]: {side} {outcome} on '{market_slug}' by {trader_info.name} "
             f"(${master_size_usd:,.2f} @ ${price:.3f})"
         )
 
@@ -219,7 +286,7 @@ class CopyTracker:
                 "shares": 0.0,
                 "price": price,
                 "proportional_fraction": 1.0,
-                "mode": "paper" if self.config.dry_run else "live",
+                "mode": mode,
                 "status": "PENDING",
                 "reason": ""
             },
@@ -231,11 +298,11 @@ class CopyTracker:
         # CASE 1: MASTER BOUGHT -> WE BUY
         # -------------------------------------------------------------
         if side == "BUY":
-            # Track master's position accumulation
-            if trader_info.address not in self.master_positions:
-                self.master_positions[trader_info.address] = {}
-            self.master_positions[trader_info.address][pos_key] = (
-                self.master_positions[trader_info.address].get(pos_key, 0.0) + master_shares
+            # Track master's position accumulation for this mode
+            if trader_info.address not in master_pos_map:
+                master_pos_map[trader_info.address] = {}
+            master_pos_map[trader_info.address][pos_key] = (
+                master_pos_map[trader_info.address].get(pos_key, 0.0) + master_shares
             )
 
             # Determine target copy size
@@ -244,20 +311,21 @@ class CopyTracker:
             else:
                 target_size_usd = trader_info.copy_amount_usd or self.config.sizing.fixed_amount_usd
 
-            # Validate against Risk Manager
+            # Validate against Risk Manager for current mode
             is_valid, reason, approved_usd = self.risk_manager.validate_trade(
                 market_slug=market_slug,
                 price=price,
                 intended_usd=target_size_usd,
-                side="buy"
+                side="buy",
+                mode=mode
             )
 
             if not is_valid:
-                logger.warning(f"Trade rejected by Risk Manager: {reason}")
-                self.portfolio["skipped_trades"] = self.portfolio.get("skipped_trades", 0) + 1
+                logger.warning(f"Trade rejected by Risk Manager [{mode.upper()}]: {reason}")
+                mode_port["skipped_trades"] = mode_port.get("skipped_trades", 0) + 1
                 log_entry["bot_execution"]["status"] = "REJECTED_BY_RISK"
                 log_entry["bot_execution"]["reason"] = reason
-                log_entry["portfolio_metrics"] = self._get_portfolio_metrics()
+                log_entry["portfolio_metrics"] = self._get_portfolio_metrics(mode)
                 self._log_trade_record(log_entry)
                 self._save_portfolio_state()
                 return {"status": "REJECTED_BY_RISK", "reason": reason, "details": log_entry}
@@ -266,10 +334,10 @@ class CopyTracker:
             try:
                 bot_shares = approved_usd / price if price > 0 else 0.0
 
-                if self.config.dry_run:
+                if mode == "paper":
                     # Paper execution
-                    self.portfolio["cash_usd"] -= approved_usd
-                    pos = self.portfolio["positions"].get(pos_key, {
+                    mode_port["cash_usd"] -= approved_usd
+                    pos = mode_port["positions"].get(pos_key, {
                         "market_slug": market_slug,
                         "market_title": market_title,
                         "outcome": outcome,
@@ -280,11 +348,11 @@ class CopyTracker:
                     pos["shares"] += bot_shares
                     pos["total_cost"] += approved_usd
                     pos["avg_price"] = pos["total_cost"] / pos["shares"] if pos["shares"] > 0 else price
-                    self.portfolio["positions"][pos_key] = pos
+                    mode_port["positions"][pos_key] = pos
 
-                    self.risk_manager.record_trade_execution(market_slug, approved_usd, "buy")
-                    self.portfolio["successful_trades"] = self.portfolio.get("successful_trades", 0) + 1
-                    self.portfolio["total_trades_count"] = self.portfolio.get("total_trades_count", 0) + 1
+                    self.risk_manager.record_trade_execution(market_slug, approved_usd, "buy", mode="paper")
+                    mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+                    mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
 
                     log_entry["bot_execution"]["status"] = "EXECUTED"
                     log_entry["bot_execution"]["amount_usd"] = approved_usd
@@ -302,9 +370,24 @@ class CopyTracker:
                     if not res.get("success"):
                         raise RuntimeError(f"Bullpen buy order failed: {res.get('error')}")
 
-                    self.risk_manager.record_trade_execution(market_slug, approved_usd, "buy")
-                    self.portfolio["successful_trades"] = self.portfolio.get("successful_trades", 0) + 1
-                    self.portfolio["total_trades_count"] = self.portfolio.get("total_trades_count", 0) + 1
+                    # Update live position in state
+                    mode_port["cash_usd"] -= approved_usd
+                    pos = mode_port["positions"].get(pos_key, {
+                        "market_slug": market_slug,
+                        "market_title": market_title,
+                        "outcome": outcome,
+                        "shares": 0.0,
+                        "total_cost": 0.0,
+                        "avg_price": price
+                    })
+                    pos["shares"] += bot_shares
+                    pos["total_cost"] += approved_usd
+                    pos["avg_price"] = pos["total_cost"] / pos["shares"] if pos["shares"] > 0 else price
+                    mode_port["positions"][pos_key] = pos
+
+                    self.risk_manager.record_trade_execution(market_slug, approved_usd, "buy", mode="live")
+                    mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+                    mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
 
                     log_entry["bot_execution"]["status"] = "EXECUTED"
                     log_entry["bot_execution"]["amount_usd"] = approved_usd
@@ -313,36 +396,36 @@ class CopyTracker:
 
             except Exception as buy_err:
                 err_msg = str(buy_err)
-                logger.error(f"Failed to execute BUY for {market_slug}: {err_msg}")
-                self.portfolio["failed_trades"] = self.portfolio.get("failed_trades", 0) + 1
-                self.portfolio["total_trades_count"] = self.portfolio.get("total_trades_count", 0) + 1
+                logger.error(f"Failed to execute BUY for {market_slug} [{mode.upper()}]: {err_msg}")
+                mode_port["failed_trades"] = mode_port.get("failed_trades", 0) + 1
+                mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
                 log_entry["bot_execution"]["status"] = "FAILED"
                 log_entry["bot_execution"]["reason"] = f"Execution error: {err_msg}"
                 log_entry["error"] = err_msg
 
         # -------------------------------------------------------------
-        # CASE 2: MASTER SOLD -> WE SELL PROPORTIONALLY (IF HELD)
+        # CASE 2: MASTER SOLD -> WE SELL PROPORTIONALLY (IF HELD IN MODE)
         # -------------------------------------------------------------
         elif side == "SELL":
-            # Check if we have an open position in this market outcome
-            held_position = self.portfolio.get("positions", {}).get(pos_key)
+            # Check if we have an open position in this mode's portfolio
+            held_position = mode_port.get("positions", {}).get(pos_key)
             if not held_position or held_position.get("shares", 0.0) <= 0.0001:
-                reason = f"No open position held for {pos_key} (Skipping sell)"
+                reason = f"No open position held in {mode.upper()} portfolio for {pos_key} (Skipping sell)"
                 logger.info(f"⏭️ {reason}")
-                self.portfolio["skipped_trades"] = self.portfolio.get("skipped_trades", 0) + 1
+                mode_port["skipped_trades"] = mode_port.get("skipped_trades", 0) + 1
                 log_entry["bot_execution"]["action"] = "SKIP"
                 log_entry["bot_execution"]["status"] = "SKIPPED"
                 log_entry["bot_execution"]["reason"] = reason
-                log_entry["portfolio_metrics"] = self._get_portfolio_metrics()
+                log_entry["portfolio_metrics"] = self._get_portfolio_metrics(mode)
                 self._log_trade_record(log_entry)
                 self._save_portfolio_state()
                 return {"status": "SKIPPED", "reason": reason, "details": log_entry}
 
             # We hold this position! Calculate proportional sell fraction
-            master_known_shares = self.master_positions.get(trader_info.address, {}).get(pos_key, 0.0)
+            master_known_shares = master_pos_map.get(trader_info.address, {}).get(pos_key, 0.0)
             if master_known_shares > 0:
                 proportional_fraction = min(1.0, master_shares / master_known_shares)
-                self.master_positions[trader_info.address][pos_key] = max(0.0, master_known_shares - master_shares)
+                master_pos_map[trader_info.address][pos_key] = max(0.0, master_known_shares - master_shares)
             else:
                 # If we don't have prior tracked master shares, sell full holding
                 proportional_fraction = 1.0
@@ -350,26 +433,25 @@ class CopyTracker:
             our_shares = held_position.get("shares", 0.0)
             shares_to_sell = our_shares * proportional_fraction
             gross_usd_value = shares_to_sell * price
+            cost_basis_sold = (shares_to_sell / our_shares) * held_position.get("total_cost", 0.0)
+            realized_pnl = gross_usd_value - cost_basis_sold
 
             try:
-                if self.config.dry_run:
+                if mode == "paper":
                     # Paper sell execution
-                    cost_basis_sold = (shares_to_sell / our_shares) * held_position.get("total_cost", 0.0)
-                    realized_pnl = gross_usd_value - cost_basis_sold
-
-                    self.portfolio["cash_usd"] += gross_usd_value
-                    self.portfolio["realized_pnl_usd"] = self.portfolio.get("realized_pnl_usd", 0.0) + realized_pnl
+                    mode_port["cash_usd"] += gross_usd_value
+                    mode_port["realized_pnl_usd"] = mode_port.get("realized_pnl_usd", 0.0) + realized_pnl
                     held_position["shares"] -= shares_to_sell
                     held_position["total_cost"] -= cost_basis_sold
 
                     if held_position["shares"] <= 0.001:
-                        del self.portfolio["positions"][pos_key]
+                        del mode_port["positions"][pos_key]
                     else:
-                        self.portfolio["positions"][pos_key] = held_position
+                        mode_port["positions"][pos_key] = held_position
 
-                    self.risk_manager.record_trade_execution(market_slug, gross_usd_value, "sell")
-                    self.portfolio["successful_trades"] = self.portfolio.get("successful_trades", 0) + 1
-                    self.portfolio["total_trades_count"] = self.portfolio.get("total_trades_count", 0) + 1
+                    self.risk_manager.record_trade_execution(market_slug, gross_usd_value, "sell", mode="paper")
+                    mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+                    mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
 
                     pnl_sign = "+" if realized_pnl >= 0 else ""
                     log_entry["bot_execution"]["status"] = "EXECUTED"
@@ -393,27 +475,41 @@ class CopyTracker:
                     if not res.get("success"):
                         raise RuntimeError(f"Bullpen sell order failed: {res.get('error')}")
 
-                    self.risk_manager.record_trade_execution(market_slug, gross_usd_value, "sell")
-                    self.portfolio["successful_trades"] = self.portfolio.get("successful_trades", 0) + 1
-                    self.portfolio["total_trades_count"] = self.portfolio.get("total_trades_count", 0) + 1
+                    mode_port["cash_usd"] += gross_usd_value
+                    mode_port["realized_pnl_usd"] = mode_port.get("realized_pnl_usd", 0.0) + realized_pnl
+                    held_position["shares"] -= shares_to_sell
+                    held_position["total_cost"] -= cost_basis_sold
 
+                    if held_position["shares"] <= 0.001:
+                        del mode_port["positions"][pos_key]
+                    else:
+                        mode_port["positions"][pos_key] = held_position
+
+                    self.risk_manager.record_trade_execution(market_slug, gross_usd_value, "sell", mode="live")
+                    mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+                    mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
+
+                    pnl_sign = "+" if realized_pnl >= 0 else ""
                     log_entry["bot_execution"]["status"] = "EXECUTED"
                     log_entry["bot_execution"]["amount_usd"] = gross_usd_value
                     log_entry["bot_execution"]["shares"] = shares_to_sell
                     log_entry["bot_execution"]["proportional_fraction"] = proportional_fraction
-                    log_entry["bot_execution"]["reason"] = f"Sold {proportional_fraction * 100:.1f}% of position (Live)"
+                    log_entry["bot_execution"]["reason"] = (
+                        f"Sold {proportional_fraction * 100:.1f}% ({shares_to_sell:.2f} shares) | "
+                        f"Realized PnL: {pnl_sign}${realized_pnl:.2f} (Live)"
+                    )
 
             except Exception as sell_err:
                 err_msg = str(sell_err)
-                logger.error(f"Failed to execute SELL for {market_slug}: {err_msg}")
-                self.portfolio["failed_trades"] = self.portfolio.get("failed_trades", 0) + 1
-                self.portfolio["total_trades_count"] = self.portfolio.get("total_trades_count", 0) + 1
+                logger.error(f"Failed to execute SELL for {market_slug} [{mode.upper()}]: {err_msg}")
+                mode_port["failed_trades"] = mode_port.get("failed_trades", 0) + 1
+                mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
                 log_entry["bot_execution"]["status"] = "FAILED"
                 log_entry["bot_execution"]["reason"] = f"Execution error: {err_msg}"
                 log_entry["error"] = err_msg
 
         # Finalize and record entry
-        log_entry["portfolio_metrics"] = self._get_portfolio_metrics()
+        log_entry["portfolio_metrics"] = self._get_portfolio_metrics(mode)
         self._log_trade_record(log_entry)
         self._save_portfolio_state()
 
@@ -423,21 +519,33 @@ class CopyTracker:
             "details": log_entry
         }
 
-    def _get_portfolio_metrics(self) -> Dict[str, Any]:
+    def _get_portfolio_metrics(self, mode: Optional[str] = None) -> Dict[str, Any]:
         """
         Returns clean snapshot metrics for logging.
         """
-        pos_val = sum(p.get("shares", 0.0) * p.get("avg_price", 0.50) for p in self.portfolio.get("positions", {}).values())
-        cash = self.portfolio.get("cash_usd", 1000.0)
+        if mode in ("paper", "live"):
+            port = self.portfolio.get(mode, {})
+            init_cash = port.get("initial_cash_usd", self.config.paper_initial_cash_usd if mode == "paper" else self.config.live_initial_cash_usd)
+            pos_val = sum(p.get("shares", 0.0) * p.get("avg_price", 0.50) for p in port.get("positions", {}).values())
+            cash = port.get("cash_usd", init_cash)
+            return {
+                "mode": mode,
+                "initial_cash_usd": round(init_cash, 2),
+                "cash_usd": round(cash, 2),
+                "positions_value_usd": round(pos_val, 2),
+                "total_equity_usd": round(cash + pos_val, 2),
+                "realized_pnl_usd": round(port.get("realized_pnl_usd", 0.0), 2),
+                "total_trades_count": port.get("total_trades_count", 0),
+                "successful_trades": port.get("successful_trades", 0),
+                "failed_trades": port.get("failed_trades", 0),
+                "skipped_trades": port.get("skipped_trades", 0),
+                "open_positions_count": len(port.get("positions", {}))
+            }
+
         return {
-            "cash_usd": round(cash, 2),
-            "positions_value_usd": round(pos_val, 2),
-            "total_equity_usd": round(cash + pos_val, 2),
-            "realized_pnl_usd": round(self.portfolio.get("realized_pnl_usd", 0.0), 2),
-            "total_trades_count": self.portfolio.get("total_trades_count", 0),
-            "successful_trades": self.portfolio.get("successful_trades", 0),
-            "failed_trades": self.portfolio.get("failed_trades", 0),
-            "open_positions_count": len(self.portfolio.get("positions", {}))
+            "paper": self._get_portfolio_metrics("paper"),
+            "live": self._get_portfolio_metrics("live"),
+            "current_mode": "paper" if self.config.dry_run else "live"
         }
 
     def poll_cycle(self) -> List[Dict[str, Any]]:

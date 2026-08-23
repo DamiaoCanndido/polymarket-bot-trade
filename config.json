@@ -4,6 +4,8 @@
   "bullpen_path": "/home/nergal/.bullpen/bin/bullpen",
   "trades_log_file": "/home/nergal/apps/polymarket/trades_log.jsonl",
   "portfolio_state_file": "/home/nergal/apps/polymarket/portfolio_state.json",
+  "paper_initial_cash_usd": 1000.0,
+  "live_initial_cash_usd": 0.0,
   "sizing": {
     "mode": "fixed",
     "fixed_amount_usd": 10.0,

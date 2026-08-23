@@ -55,6 +55,8 @@ class BotConfig:
     bullpen_path: str = "/home/nergal/.bullpen/bin/bullpen"
     trades_log_file: str = TRADES_LOG_FILE
     portfolio_state_file: str = PORTFOLIO_STATE_FILE
+    paper_initial_cash_usd: float = 1000.0  # Initial fake/simulated cash balance
+    live_initial_cash_usd: float = 0.0     # Initial live/real cash balance
     sizing: SizingConfig = field(default_factory=SizingConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     traders: List[MasterTrader] = field(default_factory=list)
@@ -73,6 +75,8 @@ class BotConfig:
             bullpen_path=data.get("bullpen_path", "/home/nergal/.bullpen/bin/bullpen"),
             trades_log_file=data.get("trades_log_file", TRADES_LOG_FILE),
             portfolio_state_file=data.get("portfolio_state_file", PORTFOLIO_STATE_FILE),
+            paper_initial_cash_usd=float(data.get("paper_initial_cash_usd", 1000.0)),
+            live_initial_cash_usd=float(data.get("live_initial_cash_usd", 0.0)),
             sizing=sizing,
             risk=risk,
             traders=traders,
@@ -115,6 +119,16 @@ def load_config(path: str = CONFIG_FILE_PATH) -> BotConfig:
     # Apply environment variable overrides if present
     if "DRY_RUN" in os.environ:
         cfg.dry_run = os.environ["DRY_RUN"].strip().lower() in ("true", "1", "yes")
+    if "PAPER_INITIAL_CASH_USD" in os.environ:
+        try:
+            cfg.paper_initial_cash_usd = float(os.environ["PAPER_INITIAL_CASH_USD"])
+        except ValueError:
+            pass
+    if "LIVE_INITIAL_CASH_USD" in os.environ:
+        try:
+            cfg.live_initial_cash_usd = float(os.environ["LIVE_INITIAL_CASH_USD"])
+        except ValueError:
+            pass
     if "BULLPEN_PATH" in os.environ:
         cfg.bullpen_path = os.environ["BULLPEN_PATH"].strip()
     if "FIXED_AMOUNT_USD" in os.environ:

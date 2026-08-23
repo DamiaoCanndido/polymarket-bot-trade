@@ -73,8 +73,8 @@ def cmd_scan(args, config: BotConfig):
 
 
 def cmd_status(args, config: BotConfig):
-    mode_str = "[green]DRY-RUN / PAPER TRADING[/green]" if config.dry_run else "[red]LIVE EXECUTION[/red]"
-    print_banner(mode="SIMULATION" if config.dry_run else "LIVE")
+    mode_str = "[cyan]DRY-RUN / PAPER TRADING (FAKE)[/cyan]" if config.dry_run else "[bold red]LIVE EXECUTION (REAL)[/bold red]"
+    print_banner(mode="SIMULAÇÃO (FAKE)" if config.dry_run else "DINHEIRO REAL (LIVE)")
 
     risk_mgr = RiskManager(config.risk)
     executor = CopyExecutor(config, risk_mgr)
@@ -82,40 +82,56 @@ def cmd_status(args, config: BotConfig):
 
     # Risk Config Summary
     summary_table = Table(show_header=False, box=None)
-    summary_table.add_row("[bold]Execution Mode:[/bold]", mode_str)
-    summary_table.add_row("[bold]Daily Budget Cap:[/bold]", f"${config.risk.daily_budget_usd:,.2f}")
-    summary_table.add_row("[bold]Max USD Per Market:[/bold]", f"${config.risk.max_per_market_usd:,.2f}")
-    summary_table.add_row("[bold]Max Trade Size:[/bold]", f"${config.risk.max_trade_size_usd:,.2f}")
-    summary_table.add_row("[bold]Allowed Price Range:[/bold]", f"${config.risk.min_price:.2f} - ${config.risk.max_price:.2f}")
-    summary_table.add_row("[bold]Slippage Tolerance:[/bold]", f"{config.risk.slippage_tolerance_pct}%")
-    summary_table.add_row("[bold]Auto Mirror Sells:[/bold]", str(config.risk.auto_exit_on_sell))
-    summary_table.add_row("[bold]Trade Log File (JSONL):[/bold]", f"[cyan]{config.trades_log_file}[/cyan]")
-    summary_table.add_row("[bold]Portfolio State File:[/bold]", f"[cyan]{config.portfolio_state_file}[/cyan]")
-    console.print(Panel(summary_table, title="[bold]Risk & Execution Configuration[/bold]", border_style="blue"))
+    summary_table.add_row("[bold]Modo Atual do Robô:[/bold]", mode_str)
+    summary_table.add_row("[bold]Limite Diário (Daily Budget Cap):[/bold]", f"${config.risk.daily_budget_usd:,.2f}")
+    summary_table.add_row("[bold]Exposição Máx por Mercado:[/bold]", f"${config.risk.max_per_market_usd:,.2f}")
+    summary_table.add_row("[bold]Tamanho Máximo por Trade:[/bold]", f"${config.risk.max_trade_size_usd:,.2f}")
+    summary_table.add_row("[bold]Faixa de Preço Permitida:[/bold]", f"${config.risk.min_price:.2f} - ${config.risk.max_price:.2f}")
+    summary_table.add_row("[bold]Tolerância de Slippage:[/bold]", f"{config.risk.slippage_tolerance_pct}%")
+    summary_table.add_row("[bold]Venda Espelho Automática:[/bold]", str(config.risk.auto_exit_on_sell))
+    summary_table.add_row("[bold]Arquivo de Trades (JSONL):[/bold]", f"[cyan]{config.trades_log_file}[/cyan]")
+    summary_table.add_row("[bold]Arquivo de Estado (JSON):[/bold]", f"[cyan]{config.portfolio_state_file}[/cyan]")
+    console.print(Panel(summary_table, title="[bold]⚙️ Configurações de Risco & Parâmetros[/bold]", border_style="blue"))
 
-    # Portfolio Summary
-    metrics = tracker._get_portfolio_metrics()
-    port_table = Table(show_header=False, box=None)
-    port_table.add_row("[bold]Cash Balance:[/bold]", f"${metrics['cash_usd']:,.2f}")
-    port_table.add_row("[bold]Open Positions Value:[/bold]", f"${metrics['positions_value_usd']:,.2f}")
-    port_table.add_row("[bold]Total Equity:[/bold]", f"[bold yellow]${metrics['total_equity_usd']:,.2f}[/bold yellow]")
-    pnl_color = "green" if metrics['realized_pnl_usd'] >= 0 else "red"
-    port_table.add_row("[bold]Realized PnL:[/bold]", f"[{pnl_color}]${metrics['realized_pnl_usd']:+,.2f}[/{pnl_color}]")
-    port_table.add_row("[bold]Total Trades Logged:[/bold]", f"{metrics['total_trades_count']} ({metrics['successful_trades']} filled, {metrics['failed_trades']} failed)")
-    port_table.add_row("[bold]Open Positions Count:[/bold]", f"{metrics['open_positions_count']}")
-    console.print(Panel(port_table, title="[bold]Portfolio & Performance Metrics[/bold]", border_style="green"))
+    # Separated Portfolios: Paper vs Live
+    paper_metrics = tracker._get_portfolio_metrics(mode="paper")
+    live_metrics = tracker._get_portfolio_metrics(mode="live")
+
+    # Paper Table
+    paper_table = Table(show_header=False, box=None)
+    paper_table.add_row("[bold]Saldo Inicial:[/bold]", f"${paper_metrics['initial_cash_usd']:,.2f}")
+    paper_table.add_row("[bold]Saldo em Caixa:[/bold]", f"${paper_metrics['cash_usd']:,.2f}")
+    paper_table.add_row("[bold]Valor em Posições:[/bold]", f"${paper_metrics['positions_value_usd']:,.2f}")
+    paper_table.add_row("[bold]Patrimônio Total (Equity):[/bold]", f"[bold cyan]${paper_metrics['total_equity_usd']:,.2f}[/bold cyan]")
+    paper_pnl_color = "green" if paper_metrics['realized_pnl_usd'] >= 0 else "red"
+    paper_table.add_row("[bold]Lucro Realizado (PnL):[/bold]", f"[{paper_pnl_color}]${paper_metrics['realized_pnl_usd']:+,.2f}[/{paper_pnl_color}]")
+    paper_table.add_row("[bold]Trades Totais:[/bold]", f"{paper_metrics['total_trades_count']} ({paper_metrics['successful_trades']} executados, {paper_metrics['failed_trades']} falhas)")
+    paper_table.add_row("[bold]Posições Abertas:[/bold]", f"{paper_metrics['open_positions_count']}")
+    console.print(Panel(paper_table, title="[bold cyan]🧪 Estatísticas: Dinheiro Fake (Simulação / Paper)[/bold cyan]", border_style="cyan"))
+
+    # Live Table
+    live_table = Table(show_header=False, box=None)
+    live_table.add_row("[bold]Saldo Inicial:[/bold]", f"${live_metrics['initial_cash_usd']:,.2f}")
+    live_table.add_row("[bold]Saldo em Caixa:[/bold]", f"${live_metrics['cash_usd']:,.2f}")
+    live_table.add_row("[bold]Valor em Posições:[/bold]", f"${live_metrics['positions_value_usd']:,.2f}")
+    live_table.add_row("[bold]Patrimônio Total (Equity):[/bold]", f"[bold emerald]${live_metrics['total_equity_usd']:,.2f}[/bold emerald]")
+    live_pnl_color = "green" if live_metrics['realized_pnl_usd'] >= 0 else "red"
+    live_table.add_row("[bold]Lucro Realizado (PnL):[/bold]", f"[{live_pnl_color}]${live_metrics['realized_pnl_usd']:+,.2f}[/{live_pnl_color}]")
+    live_table.add_row("[bold]Trades Totais:[/bold]", f"{live_metrics['total_trades_count']} ({live_metrics['successful_trades']} executados, {live_metrics['failed_trades']} falhas)")
+    live_table.add_row("[bold]Posições Abertas:[/bold]", f"{live_metrics['open_positions_count']}")
+    console.print(Panel(live_table, title="[bold green]⚡ Estatísticas: Dinheiro Real (Live Capital)[/bold green]", border_style="green"))
 
     # Tracked Traders
-    traders_table = Table(title=f"Configured Master Traders ({len(config.traders)})", border_style="cyan")
-    table_cols = ["#", "Status", "Trader", "Address", "7D Win Rate", "7D PnL", "Category", "Copy Sizing"]
+    traders_table = Table(title=f"Master Traders Configurados ({len(config.traders)})", border_style="cyan")
+    table_cols = ["#", "Status", "Trader", "Endereço", "Win Rate 7D", "Lucro 7D", "Categoria", "Sizing"]
     for c in table_cols:
         traders_table.add_column(c)
 
     for i, t in enumerate(config.traders):
-        status_str = "[green]ACTIVE[/green]" if t.enabled else "[red]PAUSED[/red]"
+        status_str = "[green]ATIVO[/green]" if t.enabled else "[red]PAUSADO[/red]"
         wr_str = f"{t.win_rate_7d * 100:.1f}%"
         pnl_str = f"+${t.pnl_7d:,.2f}" if t.pnl_7d >= 0 else f"-${abs(t.pnl_7d):,.2f}"
-        sizing_str = f"${t.copy_amount_usd:,.2f} fixed" if config.sizing.mode == "fixed" else f"{config.sizing.mirror_percent_cap}% mirror"
+        sizing_str = f"${t.copy_amount_usd:,.2f} fixo" if config.sizing.mode == "fixed" else f"{config.sizing.mirror_percent_cap}% espelho"
         traders_table.add_row(
             str(i + 1),
             status_str,
@@ -134,42 +150,52 @@ def cmd_portfolio(args, config: BotConfig):
     executor = CopyExecutor(config, risk_mgr)
     tracker = CopyTracker(config, executor, risk_mgr)
     
-    metrics = tracker._get_portfolio_metrics()
-    console.print(Panel(
-        f"[bold]Cash:[/bold] ${metrics['cash_usd']:,.2f} | "
-        f"[bold]Positions Value:[/bold] ${metrics['positions_value_usd']:,.2f} | "
-        f"[bold]Total Equity:[/bold] ${metrics['total_equity_usd']:,.2f} | "
-        f"[bold]Realized PnL:[/bold] ${metrics['realized_pnl_usd']:+,.2f}",
-        title="[bold green]Current Portfolio Overview[/bold green]",
-        border_style="green"
-    ))
+    mode = getattr(args, "mode", "all")
+    modes_to_show = ["paper", "live"] if mode == "all" else [mode]
 
-    positions = tracker.portfolio.get("positions", {})
-    if not positions:
-        console.print("[yellow]No open positions currently held.[/yellow]")
-        return
+    for m in modes_to_show:
+        metrics = tracker._get_portfolio_metrics(mode=m)
+        m_title = "🧪 DINHEIRO FAKE (SIMULAÇÃO)" if m == "paper" else "⚡ DINHEIRO REAL (LIVE)"
+        m_color = "cyan" if m == "paper" else "green"
+        pnl_color = "green" if metrics['realized_pnl_usd'] >= 0 else "red"
 
-    table = Table(title="Open Positions", border_style="cyan")
-    table.add_column("Market Slug", style="cyan")
-    table.add_column("Outcome", style="bold white")
-    table.add_column("Shares", justify="right", style="magenta")
-    table.add_column("Avg Price", justify="right", style="yellow")
-    table.add_column("Total Cost", justify="right", style="green")
+        console.print(Panel(
+            f"[bold]Caixa:[/bold] ${metrics['cash_usd']:,.2f} | "
+            f"[bold]Posições:[/bold] ${metrics['positions_value_usd']:,.2f} | "
+            f"[bold]Equity:[/bold] ${metrics['total_equity_usd']:,.2f} | "
+            f"[bold]PnL Realizado:[/bold] [{pnl_color}]${metrics['realized_pnl_usd']:+,.2f}[/{pnl_color}] | "
+            f"[bold]Trades:[/bold] {metrics['total_trades_count']} ({metrics['successful_trades']} ok, {metrics['failed_trades']} falhas)",
+            title=f"[bold {m_color}]Visão Geral: {m_title}[/bold {m_color}]",
+            border_style=m_color
+        ))
 
-    for key, pos in positions.items():
-        table.add_row(
-            pos.get("market_slug", key),
-            pos.get("outcome", "Yes"),
-            f"{pos.get('shares', 0):,.2f}",
-            f"${pos.get('avg_price', 0):.3f}",
-            f"${pos.get('total_cost', 0):,.2f}"
-        )
-    console.print(table)
+        positions = tracker.portfolio.get(m, {}).get("positions", {})
+        if not positions:
+            console.print(f"[yellow]Nenhuma posição aberta no modo {m.upper()}.[/yellow]\n")
+            continue
+
+        table = Table(title=f"Posições Abertas ({m.upper()})", border_style=m_color)
+        table.add_column("Mercado (Slug)", style="cyan")
+        table.add_column("Desfecho", style="bold yellow")
+        table.add_column("Cotas", justify="right", style="magenta")
+        table.add_column("Preço Médio", justify="right", style="yellow")
+        table.add_column("Custo Total", justify="right", style="green")
+
+        for key, pos in positions.items():
+            table.add_row(
+                pos.get("market_slug", key),
+                pos.get("outcome", "Yes"),
+                f"{pos.get('shares', 0):,.2f}",
+                f"${pos.get('avg_price', 0):.3f}",
+                f"${pos.get('total_cost', 0):,.2f}"
+            )
+        console.print(table)
+        console.print("")
 
 
 def cmd_logs(args, config: BotConfig):
     if not os.path.exists(config.trades_log_file):
-        console.print(f"[yellow]No trade log file found at {config.trades_log_file}[/yellow]")
+        console.print(f"[yellow]Arquivo de log de trades não encontrado em {config.trades_log_file}[/yellow]")
         return
 
     lines = []
@@ -182,17 +208,22 @@ def cmd_logs(args, config: BotConfig):
                     pass
 
     if not lines:
-        console.print("[yellow]Trade log is currently empty.[/yellow]")
+        console.print("[yellow]O log de trades está vazio.[/yellow]")
         return
 
-    table = Table(title=f"Recent Trade Logs (Showing last {min(len(lines), args.limit)} of {len(lines)})", border_style="cyan")
-    table.add_column("Time (UTC)", style="dim")
+    filter_mode = getattr(args, "mode", "all")
+    if filter_mode in ("paper", "live"):
+        lines = [r for r in lines if (r.get("bot_execution", {}).get("mode") or "paper").lower() == filter_mode.lower()]
+
+    table = Table(title=f"Log de Trades Recentes (Exibindo últimos {min(len(lines), args.limit)} de {len(lines)})", border_style="cyan")
+    table.add_column("Horário (UTC)", style="dim")
+    table.add_column("Modo", style="bold")
     table.add_column("Master", style="bold white")
-    table.add_column("Action", style="bold")
-    table.add_column("Market Slug", style="cyan")
-    table.add_column("Outcome", style="yellow")
-    table.add_column("Master Size", justify="right")
-    table.add_column("Copied Amount", justify="right", style="green")
+    table.add_column("Ação", style="bold")
+    table.add_column("Mercado", style="cyan")
+    table.add_column("Desfecho", style="yellow")
+    table.add_column("Tamanho Mestre", justify="right")
+    table.add_column("Copiado", justify="right", style="green")
     table.add_column("Status", style="bold")
 
     for rec in lines[-args.limit:]:
@@ -200,6 +231,9 @@ def cmd_logs(args, config: BotConfig):
         b_exec = rec.get("bot_execution", {})
         market = rec.get("market", {})
         master = rec.get("master_trader", {})
+
+        trade_mode = (b_exec.get("mode") or "paper").upper()
+        mode_str = "[cyan]🧪 FAKE[/cyan]" if trade_mode == "PAPER" else "[green]⚡ REAL[/green]"
 
         action = b_exec.get("action") or m_trade.get("side", "BUY")
         action_color = "green" if action == "BUY" else "red"
@@ -211,7 +245,8 @@ def cmd_logs(args, config: BotConfig):
 
         table.add_row(
             rec.get("timestamp", "")[:19].replace("T", " "),
-            master.get("name") or master.get("address", "")[:8],
+            mode_str,
+            master.get("name") or (master.get("address", "")[:8] if master.get("address") else "Unknown"),
             action_str,
             market.get("slug", "")[:28],
             market.get("outcome", ""),
@@ -316,10 +351,12 @@ def main():
 
     # portfolio
     p_port = subparsers.add_parser("portfolio", help="Show current open positions and equity")
+    p_port.add_argument("--mode", default="all", choices=["paper", "live", "all"], help="Filter portfolio by mode (paper, live, or all)")
 
     # logs
     p_logs = subparsers.add_parser("logs", help="Display recent trades from the JSONL log")
     p_logs.add_argument("--limit", type=int, default=20, help="Number of recent records to display")
+    p_logs.add_argument("--mode", default="all", choices=["paper", "live", "all"], help="Filter logs by mode (paper, live, or all)")
 
     # start
     p_start = subparsers.add_parser("start", help="Start the copytrading bot")

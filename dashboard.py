@@ -67,8 +67,9 @@ class BotRunnerManager:
                 try:
                     with open(self.config.portfolio_state_file, "r") as f:
                         disk_portfolio = json.load(f)
-                        self.tracker.portfolio = disk_portfolio
-                        return disk_portfolio
+                        if isinstance(disk_portfolio, dict) and "paper" in disk_portfolio and "live" in disk_portfolio:
+                            self.tracker.portfolio = disk_portfolio
+                            return disk_portfolio
                 except Exception:
                     pass
             return self.tracker.portfolio
@@ -94,7 +95,7 @@ class BotRunnerManager:
             self.reload_config()
 
             active_traders = [t for t in self.config.traders if t.enabled]
-            mode_label = "Paper Trading" if self.config.dry_run else "Live Execution"
+            mode_label = "Paper Trading (Fake)" if self.config.dry_run else "Live Execution (Real)"
 
             self.stop_event.clear()
             self.is_running = True
@@ -128,7 +129,8 @@ class BotRunnerManager:
     def _run_loop(self):
         logger.info("Background bot worker loop active.")
         active_count = len([t for t in self.config.traders if t.enabled])
-        self.log_activity("info", f"Background worker listening to {active_count} master trader feeds (interval: {self.config.poll_interval_seconds}s).")
+        mode_tag = "PAPER (FAKE)" if self.config.dry_run else "LIVE (REAL)"
+        self.log_activity("info", f"Background worker active in [{mode_tag}] listening to {active_count} master trader feeds ({self.config.poll_interval_seconds}s interval).")
         
         while not self.stop_event.is_set():
             try:
@@ -148,15 +150,16 @@ class BotRunnerManager:
                         outcome = mkt.get("outcome", "Unknown")
                         slug = mkt.get("slug", "")
                         amt = b_exec.get("amount_usd", 0.0)
+                        exec_mode = b_exec.get("mode", "paper").upper()
                         self.log_activity(
                             "success",
-                            f"⚡ Signal Executed: {action} '{outcome}' on {slug} (${amt:.2f})"
+                            f"⚡ Signal Executed [{exec_mode}]: {action} '{outcome}' on {slug} (${amt:.2f})"
                         )
                     logger.info(f"Cycle #{self.total_cycles} executed {len(executed)} trade(s).")
                 else:
                     self.log_activity(
                         "info",
-                        f"📡 Cycle #{self.total_cycles}: Polled {active_count} master traders (0 new signals)."
+                        f"📡 Cycle #{self.total_cycles} [{mode_tag}]: Polled {active_count} master traders (0 new signals)."
                     )
             except Exception as e:
                 self.last_cycle_status = "ERROR"
@@ -229,43 +232,59 @@ def parse_trade_logs(log_file: str) -> List[Dict[str, Any]]:
     return records
 
 
-def calculate_analytics(trades: List[Dict[str, Any]], portfolio: Dict[str, Any]) -> Dict[str, Any]:
+def _compute_single_mode_analytics(
+    trades: List[Dict[str, Any]],
+    mode_portfolio: Dict[str, Any],
+    mode: str = "paper",
+    initial_cash: float = 1000.0,
+    risk_summary: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
-    Computes analytics: Realized PnL, Win Rate %, Winners vs Losers, Volume, Profit Factor.
+    Calculates metrics specifically for a single mode (paper or live).
     """
-    total_trades = len(trades)
+    mode_trades = [
+        t for t in trades
+        if (t.get("bot_execution", {}).get("mode") or "paper").lower() == mode.lower()
+    ]
+    total_trades = len(mode_trades)
     executed_trades = 0
     skipped_trades = 0
     failed_trades = 0
-    
+
     buys_count = 0
     sells_count = 0
     total_bought_usd = 0.0
     total_sold_usd = 0.0
-    
+
     winners_count = 0
     losers_count = 0
     even_count = 0
     gross_profit = 0.0
     gross_loss = 0.0
 
-    # Track equity curve over time for chart
     equity_history = []
     pnl_history = []
     timestamps = []
 
     running_pnl = 0.0
-    initial_cash = portfolio.get("initial_cash_usd", 1000.0)
-    current_cash = portfolio.get("cash_usd", 1000.0)
-    realized_pnl_usd = portfolio.get("realized_pnl_usd", 0.0)
+    init_cash = float(mode_portfolio.get("initial_cash_usd", initial_cash))
+    current_cash = float(mode_portfolio.get("cash_usd", init_cash))
+    realized_pnl_usd = float(mode_portfolio.get("realized_pnl_usd", 0.0))
 
-    for tr in trades:
+    if mode_trades:
+        timestamps.append("Start")
+        pnl_history.append(0.0)
+        equity_history.append(round(init_cash, 2))
+
+    for tr in mode_trades:
         b_exec = tr.get("bot_execution", {})
         status = b_exec.get("status") or tr.get("status", "UNKNOWN")
         action = b_exec.get("action") or tr.get("master_trade", {}).get("side", "BUY")
         amt = float(b_exec.get("amount_usd") or 0.0)
         ts = tr.get("timestamp", "")
         pm = tr.get("portfolio_metrics", {})
+        if isinstance(pm, dict) and mode in pm:
+            pm = pm[mode]
 
         if status == "EXECUTED":
             executed_trades += 1
@@ -275,8 +294,6 @@ def calculate_analytics(trades: List[Dict[str, Any]], portfolio: Dict[str, Any])
             elif action == "SELL":
                 sells_count += 1
                 total_sold_usd += amt
-                
-                # Check for realized PnL in reason string or details
                 reason = b_exec.get("reason", "")
                 if "Realized PnL:" in reason:
                     try:
@@ -293,13 +310,12 @@ def calculate_analytics(trades: List[Dict[str, Any]], portfolio: Dict[str, Any])
                     except Exception:
                         pass
                 else:
-                    # If sell has no explicit PnL string, check portfolio metric change
                     winners_count += 1
 
-            if "realized_pnl_usd" in pm:
+            if isinstance(pm, dict) and "realized_pnl_usd" in pm:
                 running_pnl = float(pm["realized_pnl_usd"])
-            
-            running_equity = float(pm.get("total_equity_usd", initial_cash + running_pnl))
+
+            running_equity = float(pm.get("total_equity_usd", init_cash + running_pnl)) if isinstance(pm, dict) else (init_cash + running_pnl)
 
             timestamps.append(ts[:19].replace("T", " "))
             pnl_history.append(round(running_pnl, 2))
@@ -310,7 +326,6 @@ def calculate_analytics(trades: List[Dict[str, Any]], portfolio: Dict[str, Any])
         elif status == "FAILED":
             failed_trades += 1
 
-    # If portfolio has realized PnL from latest trade or state, ensure accuracy
     if not realized_pnl_usd and running_pnl:
         realized_pnl_usd = running_pnl
 
@@ -318,20 +333,26 @@ def calculate_analytics(trades: List[Dict[str, Any]], portfolio: Dict[str, Any])
     win_rate_pct = (winners_count / (winners_count + losers_count) * 100.0) if (winners_count + losers_count) > 0 else (100.0 if winners_count > 0 else 0.0)
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 1.0)
 
-    # Position value
-    positions = portfolio.get("positions", {})
-    open_positions_val = sum(p.get("shares", 0.0) * p.get("avg_price", 0.50) for p in positions.values())
-    total_equity = portfolio.get("total_equity_usd") or (current_cash + open_positions_val)
+    positions = mode_portfolio.get("positions", {})
+    open_positions_val = sum(float(p.get("shares", 0.0)) * float(p.get("avg_price", 0.50)) for p in positions.values())
+    total_equity = float(mode_portfolio.get("total_equity_usd", current_cash + open_positions_val))
+
+    daily_spent = risk_summary.get("daily_spent_usd", 0.0) if risk_summary else 0.0
+    daily_cap = risk_summary.get("daily_budget_usd", 100.0) if risk_summary else 100.0
 
     return {
+        "mode": mode,
+        "initial_cash_usd": round(init_cash, 2),
         "realized_pnl_usd": round(realized_pnl_usd, 2),
         "win_rate_pct": round(win_rate_pct, 1),
-        "total_trades_count": total_trades,
-        "executed_trades_count": executed_trades,
-        "skipped_trades_count": skipped_trades,
-        "failed_trades_count": failed_trades,
+        "total_trades_count": total_trades if total_trades > 0 else mode_portfolio.get("total_trades_count", 0),
+        "executed_trades_count": executed_trades if executed_trades > 0 else mode_portfolio.get("successful_trades", 0),
+        "skipped_trades_count": skipped_trades if skipped_trades > 0 else mode_portfolio.get("skipped_trades", 0),
+        "failed_trades_count": failed_trades if failed_trades > 0 else mode_portfolio.get("failed_trades", 0),
         "buys_count": buys_count,
         "sells_count": sells_count,
+        "total_bought_usd": round(total_bought_usd, 2),
+        "total_sold_usd": round(total_sold_usd, 2),
         "winners_count": winners_count,
         "losers_count": losers_count,
         "even_count": even_count,
@@ -343,9 +364,35 @@ def calculate_analytics(trades: List[Dict[str, Any]], portfolio: Dict[str, Any])
         "open_positions_value_usd": round(open_positions_val, 2),
         "total_equity_usd": round(total_equity, 2),
         "open_positions_count": len(positions),
-        "chart_timestamps": timestamps[-30:],
-        "chart_equity": equity_history[-30:],
-        "chart_pnl": pnl_history[-30:]
+        "daily_spent_usd": round(daily_spent, 2),
+        "daily_budget_usd": round(daily_cap, 2),
+        "chart_timestamps": timestamps[-30:] if timestamps else ["Start"],
+        "chart_equity": equity_history[-30:] if equity_history else [round(init_cash, 2)],
+        "chart_pnl": pnl_history[-30:] if pnl_history else [0.0]
+    }
+
+
+def calculate_analytics(trades: List[Dict[str, Any]], portfolio: Dict[str, Any], risk_manager: Optional[RiskManager] = None) -> Dict[str, Any]:
+    """
+    Computes separate analytics for Paper and Live trading modes.
+    """
+    paper_port = portfolio.get("paper", {})
+    live_port = portfolio.get("live", {})
+
+    paper_risk = risk_manager.get_risk_summary(mode="paper") if risk_manager else None
+    live_risk = risk_manager.get_risk_summary(mode="live") if risk_manager else None
+
+    paper_an = _compute_single_mode_analytics(trades, paper_port, mode="paper", initial_cash=bot_manager.config.paper_initial_cash_usd, risk_summary=paper_risk)
+    live_an = _compute_single_mode_analytics(trades, live_port, mode="live", initial_cash=bot_manager.config.live_initial_cash_usd, risk_summary=live_risk)
+
+    current_mode = "paper" if bot_manager.config.dry_run else "live"
+    active_an = paper_an if current_mode == "paper" else live_an
+
+    return {
+        "paper": paper_an,
+        "live": live_an,
+        "current_mode": current_mode,
+        **active_an
     }
 
 
@@ -382,13 +429,19 @@ def api_activity():
 def api_analytics():
     trades = parse_trade_logs(bot_manager.config.trades_log_file)
     portfolio = bot_manager.get_portfolio()
-    analytics = calculate_analytics(trades, portfolio)
+    mode = request.args.get("mode")
+    analytics = calculate_analytics(trades, portfolio, bot_manager.risk_manager)
+    if mode in ("paper", "live"):
+        return jsonify(analytics[mode])
     return jsonify(analytics)
 
 
 @app.route("/api/trades", methods=["GET"])
 def api_trades():
     trades = parse_trade_logs(bot_manager.config.trades_log_file)
+    mode = request.args.get("mode")
+    if mode in ("paper", "live"):
+        trades = [t for t in trades if (t.get("bot_execution", {}).get("mode") or "paper").lower() == mode.lower()]
     # Return newest trades first
     return jsonify(list(reversed(trades)))
 
@@ -396,8 +449,20 @@ def api_trades():
 @app.route("/api/positions", methods=["GET"])
 def api_positions():
     portfolio = bot_manager.get_portfolio()
-    positions = portfolio.get("positions", {})
-    return jsonify(positions)
+    mode = request.args.get("mode")
+    if mode == "paper":
+        return jsonify(portfolio.get("paper", {}).get("positions", {}))
+    elif mode == "live":
+        return jsonify(portfolio.get("live", {}).get("positions", {}))
+    return jsonify({
+        "paper": portfolio.get("paper", {}).get("positions", {}),
+        "live": portfolio.get("live", {}).get("positions", {})
+    })
+
+
+@app.route("/api/portfolio", methods=["GET"])
+def api_portfolio():
+    return jsonify(bot_manager.get_portfolio())
 
 
 @app.route("/api/traders", methods=["GET"])
@@ -468,6 +533,10 @@ def api_config_update():
     
     if "dry_run" in data:
         cfg.dry_run = bool(data["dry_run"])
+    if "paper_initial_cash_usd" in data:
+        cfg.paper_initial_cash_usd = float(data["paper_initial_cash_usd"])
+    if "live_initial_cash_usd" in data:
+        cfg.live_initial_cash_usd = float(data["live_initial_cash_usd"])
     if "fixed_amount_usd" in data:
         cfg.sizing.fixed_amount_usd = float(data["fixed_amount_usd"])
     if "daily_budget_usd" in data:
@@ -489,7 +558,7 @@ def api_config_update():
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="pt-BR" class="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -580,14 +649,14 @@ DASHBOARD_HTML = """
             <h1 class="text-base font-bold text-white tracking-wide flex items-center gap-2">
               POLYMARKET <span class="text-cyan-400">COPYTRADER</span>
             </h1>
-            <p class="text-xs text-gray-400">Top 25 Master Discovery & Auto Mirror</p>
+            <p class="text-xs text-gray-400">Painel de Gestão & Métricas Separadas</p>
           </div>
         </div>
 
         <!-- Live Status Pill -->
         <div id="status-pill" class="flex items-center space-x-2 px-3 py-1 rounded-full text-xs font-semibold bg-gray-800 text-gray-300 border border-gray-700 transition-all duration-300">
           <span id="status-dot" class="w-2.5 h-2.5 rounded-full bg-gray-500"></span>
-          <span id="status-text">INITIALIZING...</span>
+          <span id="status-text">CARREGANDO...</span>
         </div>
       </div>
 
@@ -595,11 +664,11 @@ DASHBOARD_HTML = """
       <div class="flex items-center space-x-3">
         <!-- Mode Switcher -->
         <div class="flex items-center bg-gray-900 border border-gray-800 rounded-lg p-1 text-xs">
-          <button id="btn-mode-paper" onclick="setMode('paper')" class="px-3 py-1 rounded font-medium transition bg-cyan-600 text-white">
-            🧪 Paper Trading
+          <button id="btn-mode-paper" onclick="setMode('paper')" class="px-3 py-1 rounded font-medium transition bg-cyan-600 text-white flex items-center gap-1.5">
+            <span>🧪</span> Dinheiro Fake
           </button>
-          <button id="btn-mode-live" onclick="setMode('live')" class="px-3 py-1 rounded font-medium transition text-gray-400 hover:text-white">
-            ⚡ Live Capital
+          <button id="btn-mode-live" onclick="setMode('live')" class="px-3 py-1 rounded font-medium transition text-gray-400 hover:text-white flex items-center gap-1.5">
+            <span>⚡</span> Dinheiro Real
           </button>
         </div>
 
@@ -608,11 +677,11 @@ DASHBOARD_HTML = """
           <span id="power-icon-container" class="flex items-center justify-center">
             <svg class="w-4 h-4 fill-current" viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3"></polygon></svg>
           </span>
-          <span id="power-text">START BOT</span>
+          <span id="power-text">INICIAR BOT</span>
         </button>
 
         <!-- Refresh Button -->
-        <button id="btn-refresh" onclick="manualRefresh()" class="p-2 rounded-lg bg-gray-800 border border-gray-700 text-gray-300 hover:text-white hover:bg-gray-700 transition" title="Refresh Dashboard">
+        <button id="btn-refresh" onclick="manualRefresh()" class="p-2 rounded-lg bg-gray-800 border border-gray-700 text-gray-300 hover:text-white hover:bg-gray-700 transition" title="Atualizar Dados">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
         </button>
       </div>
@@ -623,25 +692,95 @@ DASHBOARD_HTML = """
   <!-- MAIN CONTAINER -->
   <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 w-full space-y-6">
 
-    <!-- OVERVIEW STAT CARDS (6 METRICS) -->
+    <!-- COMPARATIVE SUMMARY BAR (FAKE VS REAL SELECTOR) -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      
+      <!-- Card: Dinheiro Fake (Paper) -->
+      <div id="summary-card-paper" onclick="setViewMode('paper')" class="glass-card rounded-xl p-4 border-2 border-cyan-500 bg-cyan-950/25 cursor-pointer hover:border-cyan-400 transition-all shadow-lg shadow-cyan-950/30">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center space-x-2.5">
+            <span class="p-2 rounded-lg bg-cyan-900/60 text-cyan-400 text-base">🧪</span>
+            <div>
+              <div class="flex items-center gap-2">
+                <h3 class="text-sm font-bold text-white">Dinheiro Fake (Simulação)</h3>
+                <span id="pill-active-paper" class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-cyan-500 text-gray-950">ATIVO NA TELA</span>
+              </div>
+              <p class="text-xs text-gray-400">Saldo virtual de teste & PnL simulado</p>
+            </div>
+          </div>
+          <div class="text-right">
+            <div id="mini-equity-paper" class="text-base font-black text-cyan-400">$1,000.00</div>
+            <div id="mini-pnl-paper" class="text-xs font-bold text-emerald-400">+$0.00 PnL</div>
+          </div>
+        </div>
+        <div class="mt-3 pt-2.5 border-t border-gray-800 flex items-center justify-between text-xs text-gray-400 font-mono">
+          <span>Trades: <strong id="mini-trades-paper" class="text-white">0</strong></span>
+          <span>Taxa de Acerto: <strong id="mini-wr-paper" class="text-emerald-400">0.0%</strong></span>
+          <span>Caixa: <strong id="mini-cash-paper" class="text-gray-300">$1,000.00</strong></span>
+        </div>
+      </div>
+
+      <!-- Card: Dinheiro Real (Live) -->
+      <div id="summary-card-live" onclick="setViewMode('live')" class="glass-card rounded-xl p-4 border border-gray-800 hover:border-emerald-500/60 cursor-pointer transition-all">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center space-x-2.5">
+            <span class="p-2 rounded-lg bg-emerald-900/40 text-emerald-400 text-base">⚡</span>
+            <div>
+              <div class="flex items-center gap-2">
+                <h3 class="text-sm font-bold text-white">Dinheiro Real (Live Trading)</h3>
+                <span id="pill-active-live" class="hidden px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500 text-gray-950">ATIVO NA TELA</span>
+              </div>
+              <p class="text-xs text-gray-400">Operações reais na sua carteira Polymarket</p>
+            </div>
+          </div>
+          <div class="text-right">
+            <div id="mini-equity-live" class="text-base font-black text-emerald-400">$0.00</div>
+            <div id="mini-pnl-live" class="text-xs font-bold text-gray-400">$0.00 PnL</div>
+          </div>
+        </div>
+        <div class="mt-3 pt-2.5 border-t border-gray-800 flex items-center justify-between text-xs text-gray-400 font-mono">
+          <span>Trades: <strong id="mini-trades-live" class="text-white">0</strong></span>
+          <span>Taxa de Acerto: <strong id="mini-wr-live" class="text-emerald-400">0.0%</strong></span>
+          <span>Caixa: <strong id="mini-cash-live" class="text-gray-300">$0.00</strong></span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- VIEW MODE INDICATOR HEADER -->
+    <div id="view-banner" class="p-3 rounded-xl bg-cyan-950/30 border border-cyan-800/80 flex items-center justify-between text-xs transition-colors">
+      <div class="flex items-center space-x-2">
+        <span id="view-banner-icon" class="text-base">🧪</span>
+        <div>
+          <span class="text-gray-400 font-medium">Exibindo Estatísticas de:</span>
+          <strong id="view-banner-title" class="text-cyan-400 font-bold ml-1 text-sm">DINHEIRO FAKE (MODO SIMULAÇÃO)</strong>
+        </div>
+      </div>
+      <div class="flex items-center space-x-2 text-gray-400">
+        <span>Modo de Execução Atual do Robô:</span>
+        <strong id="bot-engine-badge" class="px-2 py-0.5 rounded font-bold bg-cyan-900 text-cyan-300 border border-cyan-700 uppercase">SIMULAÇÃO</strong>
+      </div>
+    </div>
+
+    <!-- OVERVIEW STAT CARDS (6 METRICS FOR SELECTED VIEW MODE) -->
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
       
       <!-- Card 1: Realized PnL -->
-      <div class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-cyan-500">
+      <div id="card-stat-pnl" class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-cyan-500">
         <div class="flex items-center justify-between text-gray-400 text-xs font-medium">
-          <span>Realized PnL</span>
+          <span id="label-pnl">Realized PnL (Fake)</span>
           <span class="text-cyan-400 font-bold">$</span>
         </div>
         <div class="mt-2">
           <div id="stat-pnl" class="text-2xl font-black text-emerald-400">+$0.00</div>
-          <p id="stat-pnl-sub" class="text-xs text-gray-400 mt-1">Closed positions profit</p>
+          <p id="stat-pnl-sub" class="text-xs text-gray-400 mt-1">Lucro líquido realizado</p>
         </div>
       </div>
 
       <!-- Card 2: Win Rate -->
-      <div class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-emerald-500">
+      <div id="card-stat-winrate" class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-emerald-500">
         <div class="flex items-center justify-between text-gray-400 text-xs font-medium">
-          <span>Win Rate</span>
+          <span id="label-winrate">Win Rate (Fake)</span>
           <span class="text-emerald-400 font-bold">%</span>
         </div>
         <div class="mt-2">
@@ -653,9 +792,9 @@ DASHBOARD_HTML = """
       </div>
 
       <!-- Card 3: Winners vs Losers -->
-      <div class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-purple-500">
+      <div id="card-stat-wl" class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-purple-500">
         <div class="flex items-center justify-between text-gray-400 text-xs font-medium">
-          <span>Wins / Losses</span>
+          <span id="label-wl">Wins / Losses (Fake)</span>
           <span class="text-purple-400 font-bold">W/L</span>
         </div>
         <div class="mt-2">
@@ -669,33 +808,33 @@ DASHBOARD_HTML = """
       </div>
 
       <!-- Card 4: Total Trades -->
-      <div class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-blue-500">
+      <div id="card-stat-trades" class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-blue-500">
         <div class="flex items-center justify-between text-gray-400 text-xs font-medium">
-          <span>Copied Trades</span>
+          <span id="label-trades">Copied Trades (Fake)</span>
           <span class="text-blue-400 font-bold">#</span>
         </div>
         <div class="mt-2">
           <div id="stat-total-trades" class="text-2xl font-black text-white">0</div>
-          <p id="stat-trades-split" class="text-xs text-gray-400 mt-1">0 Buys • 0 Sells</p>
+          <p id="stat-trades-split" class="text-xs text-gray-400 mt-1">0 Executados • 0 Falhas</p>
         </div>
       </div>
 
       <!-- Card 5: Total Equity & Cash -->
-      <div class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-amber-500">
+      <div id="card-stat-equity" class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-amber-500">
         <div class="flex items-center justify-between text-gray-400 text-xs font-medium">
-          <span>Total Equity</span>
+          <span id="label-equity">Total Equity (Fake)</span>
           <span class="text-amber-400 font-bold">EQ</span>
         </div>
         <div class="mt-2">
           <div id="stat-equity" class="text-2xl font-black text-amber-400">$1,000.00</div>
-          <p id="stat-cash" class="text-xs text-gray-400 mt-1">Cash: $1,000.00</p>
+          <p id="stat-cash" class="text-xs text-gray-400 mt-1">Caixa: $1,000.00</p>
         </div>
       </div>
 
       <!-- Card 6: Daily Budget Utilization -->
-      <div class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-rose-500">
+      <div id="card-stat-budget" class="glass-card rounded-xl p-4 flex flex-col justify-between border-t-2 border-t-rose-500">
         <div class="flex items-center justify-between text-gray-400 text-xs font-medium">
-          <span>Daily Budget Cap</span>
+          <span id="label-budget">Daily Budget Cap (Fake)</span>
           <span class="text-rose-400 font-bold">CAP</span>
         </div>
         <div class="mt-2">
@@ -714,14 +853,14 @@ DASHBOARD_HTML = """
       <div class="glass-card rounded-xl p-5 lg:col-span-2 flex flex-col justify-between">
         <div class="flex items-center justify-between mb-4">
           <div>
-            <h2 class="text-sm font-bold text-white flex items-center gap-2">
-              Performance & Equity Trajectory
+            <h2 id="chart-title" class="text-sm font-bold text-white flex items-center gap-2">
+              Evolução Patrimonial & Curva de PnL (Dinheiro Fake)
             </h2>
-            <p class="text-xs text-gray-400">Live trajectory updated after each executed trade</p>
+            <p id="chart-subtitle" class="text-xs text-gray-400">Trajetória histórica atualizada a cada trade de simulação</p>
           </div>
           <span id="badge-chart-status" class="text-xs font-semibold px-2 py-0.5 rounded bg-cyan-950 text-cyan-400 border border-cyan-800 flex items-center gap-1.5">
             <span class="w-1.5 h-1.5 rounded-full bg-cyan-400 pulse-dot"></span>
-            Real-Time
+            Tempo Real
           </span>
         </div>
         <div class="h-64 w-full relative">
@@ -733,32 +872,36 @@ DASHBOARD_HTML = """
       <div class="glass-card rounded-xl p-5 flex flex-col justify-between space-y-4">
         <div>
           <h2 class="text-sm font-bold text-white flex items-center gap-2 mb-3">
-            Bot Execution Summary
+            Resumo de Execução do Robô
           </h2>
           <div class="space-y-2.5 text-xs">
             <div class="flex justify-between py-1.5 border-b border-gray-800">
-              <span class="text-gray-400">Bot Status:</span>
-              <span id="info-status" class="font-bold text-gray-400">🔴 STOPPED</span>
+              <span class="text-gray-400">Status do Bot:</span>
+              <span id="info-status" class="font-bold text-gray-400">🔴 PARADO</span>
             </div>
             <div class="flex justify-between py-1.5 border-b border-gray-800">
-              <span class="text-gray-400">Session Uptime:</span>
+              <span class="text-gray-400">Tempo de Execução:</span>
               <span id="info-uptime" class="font-bold text-white">0s</span>
             </div>
             <div class="flex justify-between py-1.5 border-b border-gray-800">
-              <span class="text-gray-400">Active Master Traders:</span>
+              <span class="text-gray-400">Modo em Operação:</span>
+              <span id="info-exec-mode" class="font-bold text-cyan-400">🧪 SIMULAÇÃO (FAKE)</span>
+            </div>
+            <div class="flex justify-between py-1.5 border-b border-gray-800">
+              <span class="text-gray-400">Master Traders Ativos:</span>
               <span id="info-traders" class="font-bold text-cyan-400">25 / 25</span>
             </div>
             <div class="flex justify-between py-1.5 border-b border-gray-800">
-              <span class="text-gray-400">Open Positions:</span>
-              <span id="info-positions" class="font-bold text-emerald-400">0 Markets</span>
+              <span class="text-gray-400">Posições Abertas (Modo Atual):</span>
+              <span id="info-positions" class="font-bold text-emerald-400">0 Mercados</span>
             </div>
             <div class="flex justify-between py-1.5 border-b border-gray-800">
-              <span class="text-gray-400">Copy Sizing Mode:</span>
-              <span id="info-sizing" class="font-bold text-yellow-400">$10.00 Fixed</span>
+              <span class="text-gray-400">Valor por Trade Copiado:</span>
+              <span id="info-sizing" class="font-bold text-yellow-400">$10.00 Fixo</span>
             </div>
             <div class="flex justify-between py-1.5">
-              <span class="text-gray-400">Auto Mirror Sells:</span>
-              <span class="font-bold text-green-400">Enabled (Proportional)</span>
+              <span class="text-gray-400">Venda Espelho Proporcional:</span>
+              <span class="font-bold text-green-400">Ativada</span>
             </div>
           </div>
         </div>
@@ -768,8 +911,8 @@ DASHBOARD_HTML = """
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
           </div>
           <div class="text-xs flex-1">
-            <p id="listener-title" class="text-gray-300 font-semibold">Feed Listener Inactive</p>
-            <p id="listener-subtitle" class="text-gray-500">Press Start to begin polling (<span id="info-poll-int">5</span>s)</p>
+            <p id="listener-title" class="text-gray-300 font-semibold">Monitor de Feed Inativo</p>
+            <p id="listener-subtitle" class="text-gray-500">Clique em Iniciar Bot para monitorar (<span id="info-poll-int">5</span>s)</p>
           </div>
         </div>
       </div>
@@ -784,62 +927,64 @@ DASHBOARD_HTML = """
           </div>
           <div>
             <h2 class="text-sm font-bold text-white flex items-center gap-2">
-              Live Execution Activity & Polling Feed
+              Terminal de Atividade & Ciclos de Polling em Tempo Real
               <span id="live-pulse-badge" class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold bg-gray-800 text-gray-400 border border-gray-700 transition-all">
                 <span id="live-pulse-dot" class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
                 <span id="live-pulse-text">STANDBY</span>
               </span>
             </h2>
-            <p class="text-xs text-gray-400">Real-time background worker cycles, smart money polling & execution events</p>
+            <p class="text-xs text-gray-400">Monitoramento dos sinais dos master traders, validações de risco e execuções</p>
           </div>
         </div>
         <div class="flex items-center space-x-3 text-xs">
           <div id="cycle-badge" class="px-2.5 py-1 rounded bg-gray-900 border border-gray-800 text-gray-300 font-mono">
-            Cycles: <span id="val-total-cycles" class="font-bold text-cyan-400">0</span>
+            Ciclos: <span id="val-total-cycles" class="font-bold text-cyan-400">0</span>
           </div>
           <div id="last-poll-badge" class="px-2.5 py-1 rounded bg-gray-900 border border-gray-800 text-gray-400 font-mono text-[11px]">
-            Last poll: <span id="val-last-poll" class="text-gray-300">Never</span>
+            Último poll: <span id="val-last-poll" class="text-gray-300">Nunca</span>
           </div>
-          <button onclick="clearActivityLogs()" class="text-gray-400 hover:text-white p-1 rounded hover:bg-gray-800 transition" title="Clear log view">
+          <button onclick="clearActivityLogs()" class="text-gray-400 hover:text-white p-1 rounded hover:bg-gray-800 transition" title="Limpar log">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
           </button>
         </div>
       </div>
       <!-- Terminal feed window -->
       <div id="activity-log-terminal" class="h-36 overflow-y-auto font-mono text-xs space-y-1.5 pr-2 bg-gray-950/90 rounded-lg p-3 border border-gray-900 select-text">
-        <div class="text-gray-500 italic">Connecting to live feed...</div>
+        <div class="text-gray-500 italic">Conectando ao feed de atividades...</div>
       </div>
     </div>
 
     <!-- TABS NAVIGATION -->
     <div class="border-b border-bordercol flex space-x-8 text-sm">
       <button onclick="switchTab('trades')" id="tab-btn-trades" class="pb-3 tab-active flex items-center gap-2">
-        <span>📋</span> Copied Trades Feed (<span id="tab-trades-count">0</span>)
+        <span>📋</span> Feed de Operações (<span id="tab-trades-count">0</span>)
       </button>
       <button onclick="switchTab('positions')" id="tab-btn-positions" class="pb-3 text-gray-400 hover:text-gray-200 flex items-center gap-2">
-        <span>📊</span> Open Positions (<span id="tab-pos-count">0</span>)
+        <span>📊</span> Posições Abertas (<span id="tab-pos-count">0</span>)
       </button>
       <button onclick="switchTab('traders')" id="tab-btn-traders" class="pb-3 text-gray-400 hover:text-gray-200 flex items-center gap-2">
         <span>👥</span> Top 25 Master Traders (<span id="tab-traders-count">25</span>)
       </button>
       <button onclick="switchTab('settings')" id="tab-btn-settings" class="pb-3 text-gray-400 hover:text-gray-200 flex items-center gap-2">
-        <span>⚙️</span> Settings & Risk Caps
+        <span>⚙️</span> Configurações & Gestão de Risco
       </button>
     </div>
 
     <!-- TAB 1: TRADES FEED -->
     <div id="tab-content-trades" class="space-y-4">
       <div class="flex flex-col sm:flex-row items-center justify-between gap-3">
-        <div class="flex items-center space-x-2">
-          <button onclick="filterTrades('ALL')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-cyan-600 text-white" data-filter="ALL">All</button>
-          <button onclick="filterTrades('EXECUTED')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="EXECUTED">Executed</button>
-          <button onclick="filterTrades('BUY')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="BUY">Buys</button>
-          <button onclick="filterTrades('SELL')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="SELL">Sells</button>
-          <button onclick="filterTrades('SKIPPED')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="SKIPPED">Skipped</button>
-          <button onclick="filterTrades('FAILED')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="FAILED">Failed</button>
+        <div class="flex items-center space-x-2 overflow-x-auto max-w-full pb-1 sm:pb-0">
+          <button onclick="filterTrades('ALL')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-cyan-600 text-white" data-filter="ALL">Todos</button>
+          <button onclick="filterTrades('PAPER_ONLY')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="PAPER_ONLY">🧪 Somente Fake</button>
+          <button onclick="filterTrades('LIVE_ONLY')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="LIVE_ONLY">⚡ Somente Real</button>
+          <button onclick="filterTrades('EXECUTED')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="EXECUTED">Executados</button>
+          <button onclick="filterTrades('BUY')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="BUY">Compras</button>
+          <button onclick="filterTrades('SELL')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="SELL">Vendas</button>
+          <button onclick="filterTrades('SKIPPED')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="SKIPPED">Ignorados</button>
+          <button onclick="filterTrades('FAILED')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-filter="FAILED">Falhas</button>
         </div>
         <div class="relative w-full sm:w-64">
-          <input type="text" id="trade-search" oninput="renderTradesTable()" placeholder="Search slug, master or outcome..." class="w-full bg-gray-900 border border-gray-800 rounded-lg px-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-cyan-500">
+          <input type="text" id="trade-search" oninput="renderTradesTable()" placeholder="Filtrar mercado, trader ou desfecho..." class="w-full bg-gray-900 border border-gray-800 rounded-lg px-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-cyan-500">
         </div>
       </div>
 
@@ -849,22 +994,23 @@ DASHBOARD_HTML = """
           <table class="w-full text-left text-xs">
             <thead class="bg-gray-900/90 text-gray-400 border-b border-bordercol uppercase tracking-wider font-semibold">
               <tr>
-                <th class="px-4 py-3">Time (UTC)</th>
+                <th class="px-4 py-3">Horário (UTC)</th>
+                <th class="px-4 py-3 text-center">Modo</th>
                 <th class="px-4 py-3">Master Trader</th>
-                <th class="px-4 py-3">Action</th>
-                <th class="px-4 py-3">Market / Slug</th>
-                <th class="px-4 py-3">Outcome</th>
-                <th class="px-4 py-3 text-right">Master Size</th>
-                <th class="px-4 py-3 text-right">Copied Amount</th>
-                <th class="px-4 py-3 text-right">Price</th>
+                <th class="px-4 py-3">Ação</th>
+                <th class="px-4 py-3">Mercado / Evento</th>
+                <th class="px-4 py-3">Desfecho</th>
+                <th class="px-4 py-3 text-right">Tamanho Mestre</th>
+                <th class="px-4 py-3 text-right">Copiado</th>
+                <th class="px-4 py-3 text-right">Preço</th>
                 <th class="px-4 py-3 text-center">Status</th>
-                <th class="px-4 py-3">Details / Result</th>
+                <th class="px-4 py-3">Detalhes / Resultado</th>
               </tr>
             </thead>
             <tbody id="trades-tbody" class="divide-y divide-gray-800">
               <tr>
-                <td colspan="10" class="px-4 py-8 text-center text-gray-500">
-                  Loading trades log...
+                <td colspan="11" class="px-4 py-8 text-center text-gray-500">
+                  Carregando histórico de operações...
                 </td>
               </tr>
             </tbody>
@@ -875,23 +1021,34 @@ DASHBOARD_HTML = """
 
     <!-- TAB 2: OPEN POSITIONS -->
     <div id="tab-content-positions" class="hidden space-y-4">
+      <div class="flex items-center justify-between bg-gray-900/60 p-3 rounded-xl border border-bordercol text-xs">
+        <div class="flex items-center space-x-2">
+          <span class="text-gray-400">Exibindo posições abertas de:</span>
+          <strong id="positions-mode-label" class="text-cyan-400 font-bold uppercase">🧪 Dinheiro Fake (Simulação)</strong>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="setViewMode('paper')" class="px-2.5 py-1 rounded bg-cyan-900 text-cyan-300 font-semibold border border-cyan-700">Ver Fake</button>
+          <button onclick="setViewMode('live')" class="px-2.5 py-1 rounded bg-emerald-900 text-emerald-300 font-semibold border border-emerald-700">Ver Real</button>
+        </div>
+      </div>
+
       <div class="glass-card rounded-xl overflow-hidden border border-bordercol">
         <div class="overflow-x-auto">
           <table class="w-full text-left text-xs">
             <thead class="bg-gray-900/90 text-gray-400 border-b border-bordercol uppercase tracking-wider font-semibold">
               <tr>
-                <th class="px-4 py-3">Market Slug / Title</th>
-                <th class="px-4 py-3">Outcome</th>
-                <th class="px-4 py-3 text-right">Shares Held</th>
-                <th class="px-4 py-3 text-right">Avg Entry Price</th>
-                <th class="px-4 py-3 text-right">Total Cost</th>
-                <th class="px-4 py-3 text-right">Current Value Est.</th>
+                <th class="px-4 py-3">Mercado / Evento</th>
+                <th class="px-4 py-3">Desfecho</th>
+                <th class="px-4 py-3 text-right">Cotas Detidas</th>
+                <th class="px-4 py-3 text-right">Preço Médio</th>
+                <th class="px-4 py-3 text-right">Custo Total</th>
+                <th class="px-4 py-3 text-right">Valor Estimado</th>
               </tr>
             </thead>
             <tbody id="positions-tbody" class="divide-y divide-gray-800">
               <tr>
                 <td colspan="6" class="px-4 py-8 text-center text-gray-500">
-                  No open positions held.
+                  Nenhuma posição aberta no momento.
                 </td>
               </tr>
             </tbody>
@@ -930,16 +1087,16 @@ DASHBOARD_HTML = """
             <thead class="bg-gray-900/90 text-gray-400 border-b border-bordercol uppercase tracking-wider font-semibold">
               <tr>
                 <th class="px-4 py-3 text-center">#</th>
-                <th class="px-4 py-3">Copy Status</th>
-                <th class="px-4 py-3">Trader Name</th>
-                <th class="px-4 py-3">Wallet Address</th>
-                <th class="px-4 py-3 text-right">7D Win Rate</th>
-                <th class="px-4 py-3 text-right">7D Realized PnL</th>
-                <th class="px-4 py-3 text-right">7D Volume</th>
-                <th class="px-4 py-3">Category</th>
-                <th class="px-4 py-3">Risk Tier</th>
-                <th class="px-4 py-3">Style</th>
-                <th class="px-4 py-3 text-center">Action</th>
+                <th class="px-4 py-3">Status Espelho</th>
+                <th class="px-4 py-3">Nome do Trader</th>
+                <th class="px-4 py-3">Endereço Carteira</th>
+                <th class="px-4 py-3 text-right">Win Rate 7D</th>
+                <th class="px-4 py-3 text-right">Lucro 7D</th>
+                <th class="px-4 py-3 text-right">Volume 7D</th>
+                <th class="px-4 py-3">Categoria</th>
+                <th class="px-4 py-3">Risco</th>
+                <th class="px-4 py-3">Estilo</th>
+                <th class="px-4 py-3 text-center">Ação</th>
               </tr>
             </thead>
             <tbody id="traders-tbody" class="divide-y divide-gray-800">
@@ -954,28 +1111,38 @@ DASHBOARD_HTML = """
     <div id="tab-content-settings" class="hidden space-y-4">
       <div class="glass-card rounded-xl p-6 max-w-2xl border border-bordercol">
         <h3 class="text-sm font-bold text-white mb-4 flex items-center gap-2">
-          Risk Management & Sizing Parameters
+          Configurações de Risco, Dimensionamento e Saldos
         </h3>
         <form id="form-settings" onsubmit="saveSettings(event)" class="space-y-4 text-xs">
           <div>
-            <label class="block text-gray-400 mb-1">Fixed Copy Amount per Trade (USD)</label>
+            <label class="block text-gray-400 mb-1">Valor Fixo por Trade Copiado (USD)</label>
             <input type="number" step="0.5" id="cfg-fixed-usd" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="10.0">
           </div>
           <div>
-            <label class="block text-gray-400 mb-1">Daily Spend Budget Cap (USD)</label>
+            <label class="block text-gray-400 mb-1">Limite Máximo de Gasto Diário (USD)</label>
             <input type="number" step="1" id="cfg-daily-budget" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="100.0">
           </div>
           <div>
-            <label class="block text-gray-400 mb-1">Max USD Exposure Per Single Market</label>
+            <label class="block text-gray-400 mb-1">Exposição Máxima por Mercado Único (USD)</label>
             <input type="number" step="1" id="cfg-max-market" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="50.0">
           </div>
           <div>
-            <label class="block text-gray-400 mb-1">Slippage Tolerance (%)</label>
+            <label class="block text-gray-400 mb-1">Tolerância de Slippage (%)</label>
             <input type="number" step="0.1" id="cfg-slippage" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="2.0">
+          </div>
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-gray-400 mb-1">Saldo Inicial Fake / Simulação (USD)</label>
+              <input type="number" step="10" id="cfg-paper-cash" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="1000.0">
+            </div>
+            <div>
+              <label class="block text-gray-400 mb-1">Saldo Inicial Real (USD)</label>
+              <input type="number" step="10" id="cfg-live-cash" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="0.0">
+            </div>
           </div>
           <div class="pt-2">
             <button id="btn-save-settings" type="submit" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 font-bold rounded-lg text-white transition flex items-center gap-2">
-              <span>Save Settings</span>
+              <span>Salvar Configurações</span>
             </button>
           </div>
         </form>
@@ -988,6 +1155,8 @@ DASHBOARD_HTML = """
   <script>
     let currentFilter = 'ALL';
     let allTrades = [];
+    let currentAnalytics = null;
+    let viewMode = 'paper'; // 'paper' or 'live'
     let equityChart = null;
     let isBotRunning = false;
     let lastKnownCycleAt = null;
@@ -1050,9 +1219,7 @@ DASHBOARD_HTML = """
         if (typeof lucide !== 'undefined' && lucide && typeof lucide.createIcons === 'function') {
           lucide.createIcons();
         }
-      } catch (e) {
-        // Fallback silently
-      }
+      } catch (e) {}
     }
 
     // Initialize Chart.js safely
@@ -1126,6 +1293,72 @@ DASHBOARD_HTML = """
       safeCreateIcons();
     }
 
+    // Switch between Viewing Paper vs Live Stats
+    function setViewMode(mode) {
+      viewMode = mode;
+      
+      const cardPaper = document.getElementById('summary-card-paper');
+      const cardLive = document.getElementById('summary-card-live');
+      const pillPaper = document.getElementById('pill-active-paper');
+      const pillLive = document.getElementById('pill-active-live');
+      
+      const viewBanner = document.getElementById('view-banner');
+      const viewBannerTitle = document.getElementById('view-banner-title');
+      const viewBannerIcon = document.getElementById('view-banner-icon');
+      const chartTitle = document.getElementById('chart-title');
+      const chartSubtitle = document.getElementById('chart-subtitle');
+      const posLabel = document.getElementById('positions-mode-label');
+
+      if (mode === 'paper') {
+        cardPaper.className = 'glass-card rounded-xl p-4 border-2 border-cyan-500 bg-cyan-950/25 cursor-pointer transition-all shadow-lg shadow-cyan-950/40';
+        cardLive.className = 'glass-card rounded-xl p-4 border border-gray-800 hover:border-emerald-500/60 cursor-pointer transition-all';
+        pillPaper.classList.remove('hidden');
+        pillLive.classList.add('hidden');
+
+        viewBanner.className = 'p-3 rounded-xl bg-cyan-950/30 border border-cyan-800/80 flex items-center justify-between text-xs transition-colors';
+        viewBannerTitle.innerText = 'DINHEIRO FAKE (MODO SIMULAÇÃO)';
+        viewBannerTitle.className = 'text-cyan-400 font-bold ml-1 text-sm';
+        viewBannerIcon.innerText = '🧪';
+
+        chartTitle.innerText = 'Evolução Patrimonial & Curva de PnL (Dinheiro Fake)';
+        chartSubtitle.innerText = 'Trajetória histórica atualizada a cada trade de simulação';
+        if (posLabel) posLabel.innerText = '🧪 Dinheiro Fake (Simulação)';
+
+        document.getElementById('label-pnl').innerText = 'Realized PnL (Fake)';
+        document.getElementById('label-winrate').innerText = 'Win Rate (Fake)';
+        document.getElementById('label-wl').innerText = 'Wins / Losses (Fake)';
+        document.getElementById('label-trades').innerText = 'Copied Trades (Fake)';
+        document.getElementById('label-equity').innerText = 'Total Equity (Fake)';
+        document.getElementById('label-budget').innerText = 'Daily Budget Cap (Fake)';
+      } else {
+        cardLive.className = 'glass-card rounded-xl p-4 border-2 border-emerald-500 bg-emerald-950/25 cursor-pointer transition-all shadow-lg shadow-emerald-950/40';
+        cardPaper.className = 'glass-card rounded-xl p-4 border border-gray-800 hover:border-cyan-500/60 cursor-pointer transition-all';
+        pillLive.classList.remove('hidden');
+        pillPaper.classList.add('hidden');
+
+        viewBanner.className = 'p-3 rounded-xl bg-emerald-950/30 border border-emerald-800/80 flex items-center justify-between text-xs transition-colors';
+        viewBannerTitle.innerText = 'DINHEIRO REAL (LIVE CAPITAL)';
+        viewBannerTitle.className = 'text-emerald-400 font-bold ml-1 text-sm';
+        viewBannerIcon.innerText = '⚡';
+
+        chartTitle.innerText = 'Evolução Patrimonial & Curva de PnL (Dinheiro Real)';
+        chartSubtitle.innerText = 'Trajetória histórica de operações reais na Polymarket';
+        if (posLabel) posLabel.innerText = '⚡ Dinheiro Real (Live Capital)';
+
+        document.getElementById('label-pnl').innerText = 'Realized PnL (Real)';
+        document.getElementById('label-winrate').innerText = 'Win Rate (Real)';
+        document.getElementById('label-wl').innerText = 'Wins / Losses (Real)';
+        document.getElementById('label-trades').innerText = 'Copied Trades (Real)';
+        document.getElementById('label-equity').innerText = 'Total Equity (Real)';
+        document.getElementById('label-budget').innerText = 'Daily Budget Cap (Real)';
+      }
+
+      if (currentAnalytics) {
+        renderAnalytics(currentAnalytics);
+      }
+      loadPositions();
+    }
+
     // Toggle Bot Power (Start / Stop) with INSTANT visual feedback
     async function toggleBotPower() {
       const powerBtn = document.getElementById('btn-power');
@@ -1137,20 +1370,20 @@ DASHBOARD_HTML = """
       powerBtn.disabled = true;
       if (willStart) {
         powerBtn.className = 'flex items-center space-x-2 px-4 py-2 rounded-lg font-bold text-sm shadow-lg transition duration-200 bg-emerald-700 text-white cursor-wait opacity-90';
-        powerText.innerText = 'STARTING...';
+        powerText.innerText = 'INICIANDO...';
         iconContainer.innerHTML = '<svg class="animate-spin w-4 h-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>';
         
         document.getElementById('status-pill').className = 'flex items-center space-x-2 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950/80 text-emerald-400 border border-emerald-800';
         document.getElementById('status-dot').className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping';
-        document.getElementById('status-text').innerText = 'STARTING WORKER...';
+        document.getElementById('status-text').innerText = 'INICIANDO WORKER...';
         
-        showToast('Starting Copytrading Bot', 'Launching background feed listener and loading master traders...', 'info');
+        showToast('Iniciando Robô', 'Conectando ao feed dos master traders...', 'info');
       } else {
         powerBtn.className = 'flex items-center space-x-2 px-4 py-2 rounded-lg font-bold text-sm shadow-lg transition duration-200 bg-rose-700 text-white cursor-wait opacity-90';
-        powerText.innerText = 'STOPPING...';
+        powerText.innerText = 'PARANDO...';
         iconContainer.innerHTML = '<svg class="animate-spin w-4 h-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>';
         
-        showToast('Stopping Bot', 'Terminating background polling cycle...', 'info');
+        showToast('Parando Robô', 'Interrompendo ciclo de monitoramento...', 'info');
       }
 
       try {
@@ -1160,15 +1393,15 @@ DASHBOARD_HTML = """
 
         if (data.success) {
           showToast(
-            willStart ? '🚀 Bot Active' : '⏹️ Bot Stopped',
-            data.message || (willStart ? 'Bot started successfully.' : 'Bot stopped successfully.'),
+            willStart ? '🚀 Robô Ativo' : '⏹️ Robô Parado',
+            data.message || (willStart ? 'Robô iniciado com sucesso.' : 'Robô parado com sucesso.'),
             willStart ? 'success' : 'warning'
           );
         } else {
-          showToast('Notice', data.message || 'Operation failed.', 'warning');
+          showToast('Aviso', data.message || 'Operação não pôde ser concluída.', 'warning');
         }
       } catch (err) {
-        showToast('Communication Error', 'Failed to reach dashboard server: ' + err.message, 'error');
+        showToast('Erro de Comunicação', 'Falha ao conectar com o servidor: ' + err.message, 'error');
       } finally {
         powerBtn.disabled = false;
         await refreshAllData();
@@ -1182,16 +1415,16 @@ DASHBOARD_HTML = """
       const btnLive = document.getElementById('btn-mode-live');
 
       if (dryRun) {
-        btnPaper.className = 'px-3 py-1 rounded font-medium transition bg-cyan-600 text-white';
-        btnLive.className = 'px-3 py-1 rounded font-medium transition text-gray-400 hover:text-white';
+        btnPaper.className = 'px-3 py-1 rounded font-medium transition bg-cyan-600 text-white flex items-center gap-1.5';
+        btnLive.className = 'px-3 py-1 rounded font-medium transition text-gray-400 hover:text-white flex items-center gap-1.5';
       } else {
-        btnLive.className = 'px-3 py-1 rounded font-medium transition bg-rose-600 text-white';
-        btnPaper.className = 'px-3 py-1 rounded font-medium transition text-gray-400 hover:text-white';
+        btnLive.className = 'px-3 py-1 rounded font-medium transition bg-rose-600 text-white flex items-center gap-1.5';
+        btnPaper.className = 'px-3 py-1 rounded font-medium transition text-gray-400 hover:text-white flex items-center gap-1.5';
       }
 
       showToast(
-        dryRun ? '🧪 Paper Trading Mode' : '⚡ Live Capital Mode',
-        dryRun ? 'Switched to paper simulation mode. No real funds deployed.' : 'Switched to LIVE execution mode. Orders will mirror on Polymarket.',
+        dryRun ? '🧪 Modo Dinheiro Fake' : '⚡ Modo Dinheiro Real',
+        dryRun ? 'Modo de simulação ativado. Nenhum saldo real será movimentado.' : 'Modo REAL ativado! As operações serão espelhadas na Polymarket com dinheiro real.',
         dryRun ? 'info' : 'warning'
       );
 
@@ -1202,8 +1435,10 @@ DASHBOARD_HTML = """
           body: JSON.stringify({ dry_run: dryRun })
         });
       } catch (err) {
-        showToast('Error', 'Failed to update execution mode: ' + err.message, 'error');
+        showToast('Erro', 'Falha ao atualizar modo: ' + err.message, 'error');
       }
+      
+      setViewMode(mode);
       refreshAllData();
     }
 
@@ -1218,13 +1453,13 @@ DASHBOARD_HTML = """
         const data = await res.json();
         if (data.success) {
           showToast(
-            data.enabled ? 'Trader Activated' : 'Trader Paused',
+            data.enabled ? 'Trader Ativado' : 'Trader Pausado',
             data.message,
             data.enabled ? 'success' : 'info'
           );
         }
       } catch (err) {
-        showToast('Error', 'Failed to toggle trader: ' + err.message, 'error');
+        showToast('Erro', 'Falha ao alterar status do trader: ' + err.message, 'error');
       }
       loadTraders();
       refreshAllData();
@@ -1235,13 +1470,15 @@ DASHBOARD_HTML = """
       e.preventDefault();
       const saveBtn = document.getElementById('btn-save-settings');
       saveBtn.disabled = true;
-      saveBtn.innerHTML = '<span>Saving...</span>';
+      saveBtn.innerHTML = '<span>Salvando...</span>';
 
       const payload = {
         fixed_amount_usd: parseFloat(document.getElementById('cfg-fixed-usd').value),
         daily_budget_usd: parseFloat(document.getElementById('cfg-daily-budget').value),
         max_per_market_usd: parseFloat(document.getElementById('cfg-max-market').value),
-        slippage_tolerance_pct: parseFloat(document.getElementById('cfg-slippage').value)
+        slippage_tolerance_pct: parseFloat(document.getElementById('cfg-slippage').value),
+        paper_initial_cash_usd: parseFloat(document.getElementById('cfg-paper-cash').value),
+        live_initial_cash_usd: parseFloat(document.getElementById('cfg-live-cash').value)
       };
 
       try {
@@ -1250,12 +1487,12 @@ DASHBOARD_HTML = """
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        showToast('⚙️ Settings Saved', 'Risk limits and sizing parameters updated and applied.', 'success');
+        showToast('⚙️ Configurações Salvas', 'Limites de risco e saldos atualizados com sucesso.', 'success');
       } catch (err) {
-        showToast('Error', 'Failed to save settings: ' + err.message, 'error');
+        showToast('Erro', 'Falha ao salvar configurações: ' + err.message, 'error');
       } finally {
         saveBtn.disabled = false;
-        saveBtn.innerHTML = '<span>Save Settings</span>';
+        saveBtn.innerHTML = '<span>Salvar Configurações</span>';
       }
       refreshAllData();
     }
@@ -1278,7 +1515,7 @@ DASHBOARD_HTML = """
       const terminal = document.getElementById('activity-log-terminal');
       if (!terminal) return;
       if (!logs || logs.length === 0) {
-        terminal.innerHTML = '<div class="text-gray-500 italic">No activity yet. Press "START BOT" to begin live copytrading.</div>';
+        terminal.innerHTML = '<div class="text-gray-500 italic">Nenhuma atividade registrada ainda. Clique em "INICIAR BOT" para começar.</div>';
         return;
       }
 
@@ -1293,11 +1530,11 @@ DASHBOARD_HTML = """
           msgColor = 'text-emerald-300 font-semibold';
         } else if (item.level === 'warning') {
           tagColor = 'text-amber-400 bg-amber-950 border-amber-800';
-          tagText = 'WARN';
+          tagText = 'AVISO';
           msgColor = 'text-amber-300';
         } else if (item.level === 'error') {
           tagColor = 'text-rose-400 bg-rose-950 border-rose-800';
-          tagText = 'ERROR';
+          tagText = 'ERRO';
           msgColor = 'text-rose-300 font-bold';
         }
 
@@ -1314,7 +1551,7 @@ DASHBOARD_HTML = """
     function clearActivityLogs() {
       const terminal = document.getElementById('activity-log-terminal');
       if (terminal) {
-        terminal.innerHTML = '<div class="text-gray-500 italic">Log view cleared. Waiting for new activity...</div>';
+        terminal.innerHTML = '<div class="text-gray-500 italic">Visualização limpa. Aguardando novas atividades...</div>';
       }
     }
 
@@ -1330,9 +1567,12 @@ DASHBOARD_HTML = """
         const market = t.market || {};
         const master = t.master_trader || {};
 
+        const mode = (b_exec.mode || 'paper').toUpperCase();
         const status = (b_exec.status || t.status || '').toUpperCase();
         const action = (b_exec.action || m_trade.side || '').toUpperCase();
         
+        if (currentFilter === 'PAPER_ONLY' && mode !== 'PAPER') return false;
+        if (currentFilter === 'LIVE_ONLY' && mode !== 'LIVE') return false;
         if (currentFilter === 'EXECUTED' && status !== 'EXECUTED') return false;
         if (currentFilter === 'BUY' && action !== 'BUY') return false;
         if (currentFilter === 'SELL' && action !== 'SELL') return false;
@@ -1340,7 +1580,7 @@ DASHBOARD_HTML = """
         if (currentFilter === 'FAILED' && status !== 'FAILED') return false;
 
         if (search) {
-          const matchStr = `${market.slug || ''} ${market.outcome || ''} ${market.title || ''} ${master.name || ''} ${master.address || ''}`.toLowerCase();
+          const matchStr = `${market.slug || ''} ${market.outcome || ''} ${market.title || ''} ${master.name || ''} ${master.address || ''} ${mode}`.toLowerCase();
           if (!matchStr.includes(search)) return false;
         }
 
@@ -1351,7 +1591,7 @@ DASHBOARD_HTML = """
       if (countEl) countEl.innerText = allTrades.length;
 
       if (filtered.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="10" class="px-4 py-8 text-center text-gray-500">No matching trades found.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="11" class="px-4 py-8 text-center text-gray-500">Nenhuma operação encontrada com os filtros atuais.</td></tr>`;
         return;
       }
 
@@ -1361,10 +1601,15 @@ DASHBOARD_HTML = """
         const market = t.market || {};
         const master = t.master_trader || {};
 
+        const tradeMode = (b_exec.mode || 'paper').toUpperCase();
+        const modeBadge = tradeMode === 'PAPER'
+          ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-cyan-950 text-cyan-400 border border-cyan-800">🧪 FAKE</span>'
+          : '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-800">⚡ REAL</span>';
+
         const action = (b_exec.action || m_trade.side || 'BUY').toUpperCase();
         const actionBadge = action === 'BUY' 
-          ? '<span class="px-2 py-0.5 rounded font-bold bg-green-950 text-green-400 border border-green-800">BUY</span>'
-          : '<span class="px-2 py-0.5 rounded font-bold bg-purple-950 text-purple-400 border border-purple-800">SELL</span>';
+          ? '<span class="px-2 py-0.5 rounded font-bold bg-green-950 text-green-400 border border-green-800">COMPRA</span>'
+          : '<span class="px-2 py-0.5 rounded font-bold bg-purple-950 text-purple-400 border border-purple-800">VENDA</span>';
 
         const status = (b_exec.status || t.status || 'EXECUTED').toUpperCase();
         let statusBadge = '';
@@ -1373,7 +1618,7 @@ DASHBOARD_HTML = """
         } else if (status === 'SKIPPED' || status === 'REJECTED_BY_RISK') {
           statusBadge = '<span class="px-2 py-0.5 rounded-full font-bold bg-yellow-950 text-yellow-400 border border-yellow-800">SKIPPED</span>';
         } else {
-          statusBadge = '<span class="px-2 py-0.5 rounded-full font-bold bg-rose-950 text-rose-400 border border-rose-800">FAILED</span>';
+          statusBadge = '<span class="px-2 py-0.5 rounded-full font-bold bg-rose-950 text-rose-400 border border-rose-800">FALHOU</span>';
         }
 
         const timeStr = (t.timestamp || '').substring(0, 19).replace('T', ' ');
@@ -1386,6 +1631,7 @@ DASHBOARD_HTML = """
         return `
           <tr class="hover:bg-gray-900/50 transition">
             <td class="px-4 py-3 text-gray-400 whitespace-nowrap font-mono text-[11px]">${timeStr}</td>
+            <td class="px-4 py-3 text-center whitespace-nowrap">${modeBadge}</td>
             <td class="px-4 py-3 font-semibold text-white whitespace-nowrap">${masterName}</td>
             <td class="px-4 py-3 whitespace-nowrap">${actionBadge}</td>
             <td class="px-4 py-3 font-mono text-cyan-400 truncate max-w-xs" title="${market.slug || ''}">${market.slug || '-'}</td>
@@ -1400,10 +1646,10 @@ DASHBOARD_HTML = """
       }).join('');
     }
 
-    // Load Open Positions
+    // Load Open Positions for Selected Mode
     async function loadPositions() {
       try {
-        const res = await fetch('/api/positions');
+        const res = await fetch('/api/positions?mode=' + viewMode);
         const positions = await res.json();
         const tbody = document.getElementById('positions-tbody');
         if (!tbody) return;
@@ -1413,7 +1659,7 @@ DASHBOARD_HTML = """
         if (posCountEl) posCountEl.innerText = keys.length;
 
         if (keys.length === 0) {
-          tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-8 text-center text-gray-500">No open positions held.</td></tr>`;
+          tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-8 text-center text-gray-500">Nenhuma posição aberta no modo ${viewMode.toUpperCase()}.</td></tr>`;
           return;
         }
 
@@ -1452,8 +1698,8 @@ DASHBOARD_HTML = """
 
         tbody.innerHTML = traders.map((t, idx) => {
           const statusBadge = t.enabled
-            ? '<span class="px-2 py-0.5 rounded font-bold bg-green-950 text-green-400 border border-green-800">ACTIVE</span>'
-            : '<span class="px-2 py-0.5 rounded font-bold bg-red-950 text-red-400 border border-red-800">PAUSED</span>';
+            ? '<span class="px-2 py-0.5 rounded font-bold bg-green-950 text-green-400 border border-green-800">ATIVO</span>'
+            : '<span class="px-2 py-0.5 rounded font-bold bg-red-950 text-red-400 border border-red-800">PAUSADO</span>';
 
           const wrStr = ((t.win_rate_7d || 0) * 100).toFixed(1) + '%';
           const pnlVal = t.pnl_7d || 0;
@@ -1476,7 +1722,7 @@ DASHBOARD_HTML = """
               <td class="px-4 py-3 text-gray-400 capitalize">${t.style}</td>
               <td class="px-4 py-3 text-center">
                 <button onclick="toggleTrader('${t.address}')" class="px-2.5 py-1 rounded text-xs font-semibold ${t.enabled ? 'bg-rose-950 text-rose-300 border border-rose-800 hover:bg-rose-900' : 'bg-emerald-950 text-emerald-300 border border-emerald-800 hover:bg-emerald-900'} transition">
-                  ${t.enabled ? 'Pause' : 'Enable'}
+                  ${t.enabled ? 'Pausar' : 'Ativar'}
                 </button>
               </td>
             </tr>
@@ -1527,10 +1773,110 @@ DASHBOARD_HTML = """
       if (btn) btn.classList.add('animate-spin');
       await refreshAllData();
       if (btn) setTimeout(() => btn.classList.remove('animate-spin'), 500);
-      showToast('Dashboard Refreshed', 'All market feeds, analytics, and metrics updated.', 'info', 2000);
+      showToast('Painel Atualizado', 'Todas as métricas e feeds foram sincronizados.', 'info', 2000);
     }
 
-    // Refresh all data
+    // Render Analytics based on selected view mode (Paper vs Live)
+    function renderAnalytics(data) {
+      if (!data) return;
+      currentAnalytics = data;
+
+      const paper = data.paper || {};
+      const live = data.live || {};
+      const an = viewMode === 'paper' ? paper : live;
+
+      // Update Mini Comparative Summary Cards
+      const miniEqPaper = document.getElementById('mini-equity-paper');
+      if (miniEqPaper) miniEqPaper.innerText = '$' + (paper.total_equity_usd || 1000).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      const miniPnlPaper = document.getElementById('mini-pnl-paper');
+      if (miniPnlPaper) {
+        const pVal = paper.realized_pnl_usd || 0;
+        miniPnlPaper.innerText = (pVal >= 0 ? '+' : '') + '$' + pVal.toFixed(2) + ' PnL';
+        miniPnlPaper.className = 'text-xs font-bold ' + (pVal >= 0 ? 'text-emerald-400' : 'text-rose-400');
+      }
+      const miniTrPaper = document.getElementById('mini-trades-paper');
+      if (miniTrPaper) miniTrPaper.innerText = `${paper.executed_trades_count || 0} filled (${paper.total_trades_count || 0} tot)`;
+      const miniWrPaper = document.getElementById('mini-wr-paper');
+      if (miniWrPaper) miniWrPaper.innerText = (paper.win_rate_pct || 0).toFixed(1) + '%';
+      const miniCashPaper = document.getElementById('mini-cash-paper');
+      if (miniCashPaper) miniCashPaper.innerText = '$' + (paper.cash_usd || 1000).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+
+      const miniEqLive = document.getElementById('mini-equity-live');
+      if (miniEqLive) miniEqLive.innerText = '$' + (live.total_equity_usd || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      const miniPnlLive = document.getElementById('mini-pnl-live');
+      if (miniPnlLive) {
+        const pVal = live.realized_pnl_usd || 0;
+        miniPnlLive.innerText = (pVal >= 0 ? '+' : '') + '$' + pVal.toFixed(2) + ' PnL';
+        miniPnlLive.className = 'text-xs font-bold ' + (pVal >= 0 ? 'text-emerald-400' : 'text-rose-400');
+      }
+      const miniTrLive = document.getElementById('mini-trades-live');
+      if (miniTrLive) miniTrLive.innerText = `${live.executed_trades_count || 0} filled (${live.failed_trades_count || 0} falhas)`;
+      const miniWrLive = document.getElementById('mini-wr-live');
+      if (miniWrLive) miniWrLive.innerText = (live.win_rate_pct || 0).toFixed(1) + '%';
+      const miniCashLive = document.getElementById('mini-cash-live');
+      if (miniCashLive) miniCashLive.innerText = '$' + (live.cash_usd || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+
+      // Update 6 Main Stat Cards for Active View Mode
+      const pnlEl = document.getElementById('stat-pnl');
+      if (pnlEl) {
+        const pnlVal = an.realized_pnl_usd || 0;
+        pnlEl.innerText = (pnlVal >= 0 ? '+$' : '-$') + Math.abs(pnlVal).toFixed(2);
+        pnlEl.className = 'text-2xl font-black ' + (pnlVal >= 0 ? 'text-emerald-400' : 'text-rose-400');
+      }
+
+      const wrEl = document.getElementById('stat-winrate');
+      if (wrEl) wrEl.innerText = (an.win_rate_pct || 0).toFixed(1) + '%';
+      const wrBar = document.getElementById('stat-winrate-bar');
+      if (wrBar) wrBar.style.width = (an.win_rate_pct || 0) + '%';
+
+      const winsEl = document.getElementById('stat-wins');
+      if (winsEl) winsEl.innerText = (an.winners_count || 0) + 'W';
+      const lossEl = document.getElementById('stat-losses');
+      if (lossEl) lossEl.innerText = (an.losers_count || 0) + 'L';
+      const pfEl = document.getElementById('stat-profit-factor');
+      if (pfEl) pfEl.innerText = `Profit Factor: ${(an.profit_factor || 1.0).toFixed(2)}x`;
+
+      const totalTradesEl = document.getElementById('stat-total-trades');
+      if (totalTradesEl) totalTradesEl.innerText = an.total_trades_count || 0;
+      const tradesSplitEl = document.getElementById('stat-trades-split');
+      if (tradesSplitEl) tradesSplitEl.innerText = `${an.executed_trades_count || 0} Executados • ${an.failed_trades_count || 0} Falhas`;
+
+      const eqEl = document.getElementById('stat-equity');
+      if (eqEl) eqEl.innerText = '$' + (an.total_equity_usd || (viewMode === 'paper' ? 1000 : 0)).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      const cashEl = document.getElementById('stat-cash');
+      if (cashEl) cashEl.innerText = 'Caixa: $' + (an.cash_usd || (viewMode === 'paper' ? 1000 : 0)).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+
+      const dailySpent = an.daily_spent_usd || 0;
+      const dailyCap = an.daily_budget_usd || 100;
+      const budgetEl = document.getElementById('stat-budget');
+      if (budgetEl) budgetEl.innerText = `$${dailySpent.toFixed(2)} / $${dailyCap.toFixed(0)}`;
+      const budgetBar = document.getElementById('stat-budget-bar');
+      if (budgetBar) budgetBar.style.width = Math.min(100, (dailySpent / dailyCap) * 100) + '%';
+
+      const infoPos = document.getElementById('info-positions');
+      if (infoPos) infoPos.innerText = `${an.open_positions_count || 0} Mercados`;
+
+      // Update Chart for Active View Mode
+      if (!equityChart) {
+        initChart();
+      }
+      if (equityChart && an.chart_timestamps && an.chart_timestamps.length > 0) {
+        equityChart.data.labels = an.chart_timestamps;
+        equityChart.data.datasets[0].data = an.chart_equity;
+        if (viewMode === 'paper') {
+          equityChart.data.datasets[0].borderColor = '#06b6d4';
+          equityChart.data.datasets[0].backgroundColor = 'rgba(6, 182, 212, 0.1)';
+          equityChart.data.datasets[0].pointBackgroundColor = '#22d3ee';
+        } else {
+          equityChart.data.datasets[0].borderColor = '#10b981';
+          equityChart.data.datasets[0].backgroundColor = 'rgba(16, 185, 129, 0.1)';
+          equityChart.data.datasets[0].pointBackgroundColor = '#34d399';
+        }
+        equityChart.update();
+      }
+    }
+
+    // Refresh all data from APIs
     async function refreshAllData() {
       // 1. Fetch Status
       try {
@@ -1546,59 +1892,73 @@ DASHBOARD_HTML = """
         const statusDot = document.getElementById('status-dot');
         const statusText = document.getElementById('status-text');
 
+        const engineBadge = document.getElementById('bot-engine-badge');
+        if (engineBadge) {
+          engineBadge.innerText = status.mode === 'paper' ? '🧪 SIMULAÇÃO (FAKE)' : '⚡ REAL (LIVE)';
+          engineBadge.className = status.mode === 'paper'
+            ? 'px-2 py-0.5 rounded font-bold bg-cyan-900 text-cyan-300 border border-cyan-700 uppercase'
+            : 'px-2 py-0.5 rounded font-bold bg-emerald-900 text-emerald-300 border border-emerald-700 uppercase';
+        }
+
+        const infoExecMode = document.getElementById('info-exec-mode');
+        if (infoExecMode) {
+          infoExecMode.innerText = status.mode === 'paper' ? '🧪 SIMULAÇÃO (FAKE)' : '⚡ REAL (LIVE)';
+          infoExecMode.className = status.mode === 'paper' ? 'font-bold text-cyan-400' : 'font-bold text-emerald-400';
+        }
+
         if (status.is_running) {
           if (powerBtn) {
             powerBtn.className = 'flex items-center space-x-2 px-4 py-2 rounded-lg font-bold text-sm shadow-lg transition duration-200 transform active:scale-95 bg-rose-600 hover:bg-rose-500 text-white shadow-rose-600/20';
-            if (powerText) powerText.innerText = 'STOP BOT';
+            if (powerText) powerText.innerText = 'PARAR BOT';
             if (iconContainer) iconContainer.innerHTML = '<svg class="w-4 h-4 fill-current" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"></rect></svg>';
           }
           
           if (statusPill) statusPill.className = 'flex items-center space-x-2 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800';
           if (statusDot) statusDot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 pulse-dot';
-          if (statusText) statusText.innerText = `LIVE LISTENING (${status.mode.toUpperCase()})`;
+          if (statusText) statusText.innerText = `ROBÔ ATIVO (${status.mode.toUpperCase()})`;
           
           const infoStatus = document.getElementById('info-status');
-          if (infoStatus) infoStatus.innerHTML = '<span class="text-emerald-400 font-bold">🟢 ACTIVE (' + status.mode.toUpperCase() + ')</span>';
+          if (infoStatus) infoStatus.innerHTML = '<span class="text-emerald-400 font-bold">🟢 ATIVO (' + status.mode.toUpperCase() + ')</span>';
 
           const listenerIconBg = document.getElementById('listener-icon-bg');
           if (listenerIconBg) listenerIconBg.className = 'p-2 rounded bg-cyan-950 text-cyan-400 border border-cyan-800';
           const listenerTitle = document.getElementById('listener-title');
           if (listenerTitle) {
             listenerTitle.className = 'text-white font-semibold flex items-center gap-1.5';
-            listenerTitle.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> Live Feed Active';
+            listenerTitle.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> Monitor de Feed Ativo';
           }
           const listenerSubtitle = document.getElementById('listener-subtitle');
-          if (listenerSubtitle) listenerSubtitle.innerText = `Polling ${status.active_traders_count} traders every ${status.poll_interval_seconds}s`;
+          if (listenerSubtitle) listenerSubtitle.innerText = `Monitorando ${status.active_traders_count} traders a cada ${status.poll_interval_seconds}s`;
 
           const pulseBadge = document.getElementById('live-pulse-badge');
           if (pulseBadge) pulseBadge.className = 'inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-800';
           const pulseDot = document.getElementById('live-pulse-dot');
           if (pulseDot) pulseDot.className = 'w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping';
           const pulseText = document.getElementById('live-pulse-text');
-          if (pulseText) pulseText.innerText = 'LISTENING';
+          if (pulseText) pulseText.innerText = 'MONITORANDO';
         } else {
           if (powerBtn) {
             powerBtn.className = 'flex items-center space-x-2 px-4 py-2 rounded-lg font-bold text-sm shadow-lg transition duration-200 transform active:scale-95 bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-600/20';
-            if (powerText) powerText.innerText = 'START BOT';
+            if (powerText) powerText.innerText = 'INICIAR BOT';
             if (iconContainer) iconContainer.innerHTML = '<svg class="w-4 h-4 fill-current" viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3"></polygon></svg>';
           }
           
           if (statusPill) statusPill.className = 'flex items-center space-x-2 px-3 py-1 rounded-full text-xs font-semibold bg-gray-800 text-gray-300 border border-gray-700';
           if (statusDot) statusDot.className = 'w-2.5 h-2.5 rounded-full bg-gray-500';
-          if (statusText) statusText.innerText = 'BOT STOPPED';
+          if (statusText) statusText.innerText = 'ROBÔ PARADO';
           
           const infoStatus = document.getElementById('info-status');
-          if (infoStatus) infoStatus.innerHTML = '<span class="text-gray-400 font-bold">🔴 STOPPED</span>';
+          if (infoStatus) infoStatus.innerHTML = '<span class="text-gray-400 font-bold">🔴 PARADO</span>';
 
           const listenerIconBg = document.getElementById('listener-icon-bg');
           if (listenerIconBg) listenerIconBg.className = 'p-2 rounded bg-gray-800 text-gray-400';
           const listenerTitle = document.getElementById('listener-title');
           if (listenerTitle) {
             listenerTitle.className = 'text-gray-300 font-semibold';
-            listenerTitle.innerText = 'Feed Listener Inactive';
+            listenerTitle.innerText = 'Monitor de Feed Inativo';
           }
           const listenerSubtitle = document.getElementById('listener-subtitle');
-          if (listenerSubtitle) listenerSubtitle.innerText = `Press Start to begin polling (${status.poll_interval_seconds}s)`;
+          if (listenerSubtitle) listenerSubtitle.innerText = `Clique em Iniciar Bot para monitorar (${status.poll_interval_seconds}s)`;
 
           const pulseBadge = document.getElementById('live-pulse-badge');
           if (pulseBadge) pulseBadge.className = 'inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold bg-gray-800 text-gray-400 border border-gray-700';
@@ -1611,11 +1971,11 @@ DASHBOARD_HTML = """
         const btnPaper = document.getElementById('btn-mode-paper');
         const btnLive = document.getElementById('btn-mode-live');
         if (status.mode === 'paper') {
-          if (btnPaper) btnPaper.className = 'px-3 py-1 rounded font-medium transition bg-cyan-600 text-white';
-          if (btnLive) btnLive.className = 'px-3 py-1 rounded font-medium transition text-gray-400 hover:text-white';
+          if (btnPaper) btnPaper.className = 'px-3 py-1 rounded font-medium transition bg-cyan-600 text-white flex items-center gap-1.5';
+          if (btnLive) btnLive.className = 'px-3 py-1 rounded font-medium transition text-gray-400 hover:text-white flex items-center gap-1.5';
         } else {
-          if (btnLive) btnLive.className = 'px-3 py-1 rounded font-medium transition bg-rose-600 text-white';
-          if (btnPaper) btnPaper.className = 'px-3 py-1 rounded font-medium transition text-gray-400 hover:text-white';
+          if (btnLive) btnLive.className = 'px-3 py-1 rounded font-medium transition bg-rose-600 text-white flex items-center gap-1.5';
+          if (btnPaper) btnPaper.className = 'px-3 py-1 rounded font-medium transition text-gray-400 hover:text-white flex items-center gap-1.5';
         }
 
         const infoUptime = document.getElementById('info-uptime');
@@ -1632,59 +1992,11 @@ DASHBOARD_HTML = """
         console.error('Error fetching status:', err);
       }
 
-      // 2. Fetch Analytics
+      // 2. Fetch Separated Analytics
       try {
         const analyticsRes = await fetch('/api/analytics');
-        const an = await analyticsRes.json();
-
-        const pnlEl = document.getElementById('stat-pnl');
-        if (pnlEl) {
-          const pnlVal = an.realized_pnl_usd || 0;
-          pnlEl.innerText = (pnlVal >= 0 ? '+$' : '-$') + Math.abs(pnlVal).toFixed(2);
-          pnlEl.className = 'text-2xl font-black ' + (pnlVal >= 0 ? 'text-emerald-400' : 'text-rose-400');
-        }
-
-        const wrEl = document.getElementById('stat-winrate');
-        if (wrEl) wrEl.innerText = (an.win_rate_pct || 0).toFixed(1) + '%';
-        const wrBar = document.getElementById('stat-winrate-bar');
-        if (wrBar) wrBar.style.width = (an.win_rate_pct || 0) + '%';
-
-        const winsEl = document.getElementById('stat-wins');
-        if (winsEl) winsEl.innerText = (an.winners_count || 0) + 'W';
-        const lossEl = document.getElementById('stat-losses');
-        if (lossEl) lossEl.innerText = (an.losers_count || 0) + 'L';
-        const pfEl = document.getElementById('stat-profit-factor');
-        if (pfEl) pfEl.innerText = `Profit Factor: ${(an.profit_factor || 1.0).toFixed(2)}x`;
-
-        const totalTradesEl = document.getElementById('stat-total-trades');
-        if (totalTradesEl) totalTradesEl.innerText = an.total_trades_count || 0;
-        const tradesSplitEl = document.getElementById('stat-trades-split');
-        if (tradesSplitEl) tradesSplitEl.innerText = `${an.buys_count || 0} Buys • ${an.sells_count || 0} Sells`;
-
-        const eqEl = document.getElementById('stat-equity');
-        if (eqEl) eqEl.innerText = '$' + (an.total_equity_usd || 1000).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
-        const cashEl = document.getElementById('stat-cash');
-        if (cashEl) cashEl.innerText = 'Cash: $' + (an.cash_usd || 1000).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
-
-        const dailySpent = (an.daily_spent_usd) || 0;
-        const dailyCap = (an.daily_budget_usd) || 100;
-        const budgetEl = document.getElementById('stat-budget');
-        if (budgetEl) budgetEl.innerText = `$${dailySpent.toFixed(2)} / $${dailyCap.toFixed(0)}`;
-        const budgetBar = document.getElementById('stat-budget-bar');
-        if (budgetBar) budgetBar.style.width = Math.min(100, (dailySpent / dailyCap) * 100) + '%';
-
-        const infoPos = document.getElementById('info-positions');
-        if (infoPos) infoPos.innerText = `${an.open_positions_count || 0} Markets`;
-
-        // Update or initialize Chart
-        if (!equityChart) {
-          initChart();
-        }
-        if (an.chart_timestamps && an.chart_timestamps.length > 0 && equityChart) {
-          equityChart.data.labels = an.chart_timestamps;
-          equityChart.data.datasets[0].data = an.chart_equity;
-          equityChart.update();
-        }
+        const analyticsData = await analyticsRes.json();
+        renderAnalytics(analyticsData);
       } catch (err) {
         console.error('Error fetching analytics:', err);
       }
@@ -1714,19 +2026,19 @@ DASHBOARD_HTML = """
       if (!lastPollEl) return;
 
       if (!lastKnownCycleAt) {
-        lastPollEl.innerText = isBotRunning ? 'Starting first cycle...' : 'Never';
+        lastPollEl.innerText = isBotRunning ? 'Iniciando primeiro ciclo...' : 'Nunca';
         return;
       }
 
       const diffSecs = Math.max(0, Math.floor((new Date() - lastKnownCycleAt) / 1000));
       if (diffSecs === 0) {
-        lastPollEl.innerText = 'Just now';
+        lastPollEl.innerText = 'Agora mesmo';
       } else if (diffSecs < 60) {
-        lastPollEl.innerText = `${diffSecs}s ago`;
+        lastPollEl.innerText = `${diffSecs}s atrás`;
       } else {
         const mins = Math.floor(diffSecs / 60);
         const remSecs = diffSecs % 60;
-        lastPollEl.innerText = `${mins}m ${remSecs}s ago`;
+        lastPollEl.innerText = `${mins}m ${remSecs}s atrás`;
       }
     }
 
@@ -1754,7 +2066,7 @@ def index():
 
 def run_dashboard(host: str = "0.0.0.0", port: int = 5000, debug: bool = False):
     print(f"\n=======================================================")
-    print(f"🚀 POLYMARKET COPYTRADING DASHBOARD")
+    print(f"🚀 POLYMARKET COPYTRADING DASHBOARD (SEPARATED STATS)")
     print(f"📡 Local Web UI URL: http://localhost:{port}")
     print(f"=======================================================\n")
     app.run(host=host, port=port, debug=debug)
@@ -1768,3 +2080,4 @@ if __name__ == "__main__":
         except ValueError:
             pass
     run_dashboard(port=port)
+
