@@ -320,20 +320,29 @@ def _compute_single_mode_analytics(
                 sells_count += 1
                 total_sold_usd += amt
                 reason = b_exec.get("reason", "")
+                pnl_val = None
                 if "Realized PnL:" in reason:
                     try:
                         pnl_part = reason.split("Realized PnL:")[1].split()[0].replace("$", "").replace("+", "").replace(",", "")
                         pnl_val = float(pnl_part)
-                        if pnl_val > 0.001:
-                            winners_count += 1
-                            gross_profit += pnl_val
-                        elif pnl_val < -0.001:
-                            losers_count += 1
-                            gross_loss += abs(pnl_val)
-                        else:
-                            even_count += 1
                     except Exception:
                         pass
+                elif "Realizou lucro de" in reason:
+                    try:
+                        pnl_part = reason.split("Realizou lucro de")[1].split()[0].replace("$", "").replace("+", "").replace(",", "")
+                        pnl_val = float(pnl_part)
+                    except Exception:
+                        pass
+
+                if pnl_val is not None:
+                    if pnl_val > 0.001:
+                        winners_count += 1
+                        gross_profit += pnl_val
+                    elif pnl_val < -0.001:
+                        losers_count += 1
+                        gross_loss += abs(pnl_val)
+                    else:
+                        even_count += 1
                 else:
                     winners_count += 1
 
@@ -351,7 +360,9 @@ def _compute_single_mode_analytics(
         elif status == "FAILED":
             failed_trades += 1
 
-    if not realized_pnl_usd and running_pnl:
+    if mode_trades and running_pnl is not None:
+        realized_pnl_usd = running_pnl
+    elif not realized_pnl_usd and running_pnl:
         realized_pnl_usd = running_pnl
 
     closed_trades_count = winners_count + losers_count + even_count
@@ -360,6 +371,8 @@ def _compute_single_mode_analytics(
 
     positions = mode_portfolio.get("positions", {})
     open_positions_val = sum(float(p.get("shares", 0.0)) * float(p.get("avg_price", 0.50)) for p in positions.values())
+    if "cash_usd" in mode_portfolio:
+        current_cash = float(mode_portfolio["cash_usd"])
     total_equity = float(mode_portfolio.get("total_equity_usd", current_cash + open_positions_val))
 
     daily_spent = risk_summary.get("daily_spent_usd", 0.0) if risk_summary else 0.0
@@ -563,6 +576,23 @@ def api_wallet_sync():
     return jsonify(res)
 
 
+@app.route("/api/config", methods=["GET"])
+def api_config_get():
+    cfg = load_config()
+    return jsonify({
+        "dry_run": cfg.dry_run,
+        "fixed_amount_usd": cfg.sizing.fixed_amount_usd,
+        "daily_budget_usd": cfg.risk.daily_budget_usd,
+        "max_per_market_usd": cfg.risk.max_per_market_usd,
+        "slippage_tolerance_pct": cfg.risk.slippage_tolerance_pct,
+        "paper_initial_cash_usd": cfg.paper_initial_cash_usd,
+        "live_initial_cash_usd": cfg.live_initial_cash_usd,
+        "auto_take_profit": getattr(cfg.risk, "auto_take_profit", True),
+        "take_profit_price": getattr(cfg.risk, "take_profit_price", 0.90),
+        "take_profit_min_gain_pct": getattr(cfg.risk, "take_profit_min_gain_pct", 20.0),
+    })
+
+
 @app.route("/api/config/update", methods=["POST"])
 def api_config_update():
     data = request.get_json(silent=True) or {}
@@ -588,6 +618,12 @@ def api_config_update():
         cfg.risk.max_per_market_usd = float(data["max_per_market_usd"])
     if "slippage_tolerance_pct" in data:
         cfg.risk.slippage_tolerance_pct = float(data["slippage_tolerance_pct"])
+    if "auto_take_profit" in data:
+        cfg.risk.auto_take_profit = bool(data["auto_take_profit"])
+    if "take_profit_price" in data:
+        cfg.risk.take_profit_price = float(data["take_profit_price"])
+    if "take_profit_min_gain_pct" in data:
+        cfg.risk.take_profit_min_gain_pct = float(data["take_profit_min_gain_pct"])
 
     save_config(cfg)
     bot_manager.reload_config()
@@ -1193,6 +1229,35 @@ DASHBOARD_HTML = """
               <input type="number" step="1" id="cfg-live-cash" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="0.0">
             </div>
           </div>
+
+          <!-- Auto Take-Profit Card -->
+          <div class="p-3.5 bg-emerald-950/20 border border-emerald-800/60 rounded-lg space-y-3">
+            <div class="flex items-center justify-between">
+              <div>
+                <label class="font-bold text-emerald-400 flex items-center gap-1.5 text-xs">
+                  <span>🎯</span> Auto Take-Profit (Venda com Lucro Automático)
+                </label>
+                <p class="text-[11px] text-gray-400 mt-0.5">Vende a posição sozinho assim que atingir o alvo de preço ou lucro, sem esperar o trader mestre.</p>
+              </div>
+              <label class="relative inline-flex items-center cursor-pointer">
+                <input type="checkbox" id="cfg-auto-tp" class="sr-only peer" checked>
+                <div class="w-9 h-5 bg-gray-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-600"></div>
+              </label>
+            </div>
+            <div class="grid grid-cols-2 gap-3 pt-1">
+              <div>
+                <label class="block text-gray-400 mb-1">Preço Alvo de Venda (USD)</label>
+                <input type="number" step="0.01" min="0.50" max="0.99" id="cfg-tp-price" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="0.90" title="Vende se a cota atingir este preço (ex: 0.90 = 90¢)">
+                <span class="text-[10px] text-gray-500">Ex: 0.90 (vende a 90¢)</span>
+              </div>
+              <div>
+                <label class="block text-gray-400 mb-1">Lucro Mínimo Alvo (%)</label>
+                <input type="number" step="1" min="0" id="cfg-tp-gain" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="20.0" title="Vende se o lucro passar desta porcentagem">
+                <span class="text-[10px] text-gray-500">Ex: 20% de lucro</span>
+              </div>
+            </div>
+          </div>
+
           <div class="pt-2">
             <button id="btn-save-settings" type="submit" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 font-bold rounded-lg text-white transition flex items-center gap-2">
               <span>Salvar Configurações</span>
@@ -1531,7 +1596,10 @@ DASHBOARD_HTML = """
         max_per_market_usd: parseFloat(document.getElementById('cfg-max-market').value),
         slippage_tolerance_pct: parseFloat(document.getElementById('cfg-slippage').value),
         paper_initial_cash_usd: parseFloat(document.getElementById('cfg-paper-cash').value),
-        live_initial_cash_usd: parseFloat(document.getElementById('cfg-live-cash').value)
+        live_initial_cash_usd: parseFloat(document.getElementById('cfg-live-cash').value),
+        auto_take_profit: document.getElementById('cfg-auto-tp') ? document.getElementById('cfg-auto-tp').checked : true,
+        take_profit_price: parseFloat(document.getElementById('cfg-tp-price').value || 0.90),
+        take_profit_min_gain_pct: parseFloat(document.getElementById('cfg-tp-gain').value || 20.0)
       };
 
       try {
@@ -1540,7 +1608,7 @@ DASHBOARD_HTML = """
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        showToast('⚙️ Configurações Salvas', 'Limites de risco e saldos atualizados com sucesso.', 'success');
+        showToast('⚙️ Configurações Salvas', 'Limites de risco, saldos e Auto Take-Profit atualizados com sucesso.', 'success');
       } catch (err) {
         showToast('Erro', 'Falha ao salvar configurações: ' + err.message, 'error');
       } finally {
@@ -1548,6 +1616,27 @@ DASHBOARD_HTML = """
         saveBtn.innerHTML = '<span>Salvar Configurações</span>';
       }
       refreshAllData();
+    }
+
+    // Load initial settings from server
+    async function loadSettings() {
+      try {
+        const res = await fetch('/api/config');
+        const data = await res.json();
+        if (data) {
+          if (document.getElementById('cfg-fixed-usd') && data.fixed_amount_usd !== undefined) document.getElementById('cfg-fixed-usd').value = data.fixed_amount_usd;
+          if (document.getElementById('cfg-daily-budget') && data.daily_budget_usd !== undefined) document.getElementById('cfg-daily-budget').value = data.daily_budget_usd;
+          if (document.getElementById('cfg-max-market') && data.max_per_market_usd !== undefined) document.getElementById('cfg-max-market').value = data.max_per_market_usd;
+          if (document.getElementById('cfg-slippage') && data.slippage_tolerance_pct !== undefined) document.getElementById('cfg-slippage').value = data.slippage_tolerance_pct;
+          if (document.getElementById('cfg-paper-cash') && data.paper_initial_cash_usd !== undefined) document.getElementById('cfg-paper-cash').value = data.paper_initial_cash_usd;
+          if (document.getElementById('cfg-live-cash') && data.live_initial_cash_usd !== undefined) document.getElementById('cfg-live-cash').value = data.live_initial_cash_usd;
+          if (document.getElementById('cfg-auto-tp') && data.auto_take_profit !== undefined) document.getElementById('cfg-auto-tp').checked = data.auto_take_profit;
+          if (document.getElementById('cfg-tp-price') && data.take_profit_price !== undefined) document.getElementById('cfg-tp-price').value = data.take_profit_price;
+          if (document.getElementById('cfg-tp-gain') && data.take_profit_min_gain_pct !== undefined) document.getElementById('cfg-tp-gain').value = data.take_profit_min_gain_pct;
+        }
+      } catch (err) {
+        console.error('Failed to load settings:', err);
+      }
     }
 
     // Sincronizar Saldo On-chain da Carteira Real via Bullpen
@@ -2136,6 +2225,7 @@ DASHBOARD_HTML = """
     window.addEventListener('DOMContentLoaded', () => {
       initChart();
       loadTraders();
+      loadSettings();
       refreshAllData();
       safeCreateIcons();
       // Auto refresh data every 2.0 seconds

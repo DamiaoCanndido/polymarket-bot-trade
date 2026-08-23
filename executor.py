@@ -73,6 +73,59 @@ class CopyExecutor:
             }
         return {"success": False, "error": res.get("error", "Failed to query wallet balance"), "balance_usd": 0.0}
 
+    def get_market_prices(self, market_slug: str) -> Dict[str, float]:
+        """
+        Retrieves live outcome prices for a given market slug.
+        Returns a dict mapping outcome name -> price float (e.g. {"Team Spirit": 0.999, "TEAM VISION": 0.01}).
+        """
+        if not market_slug:
+            return {}
+
+        prices: Dict[str, float] = {}
+
+        # 1. Primary: Bullpen CLI CLOB price check
+        res = self._run_cli(["polymarket", "price", market_slug])
+        if res.get("success"):
+            outcomes = res.get("outcomes") or []
+            if isinstance(outcomes, list):
+                for item in outcomes:
+                    name = item.get("outcome")
+                    p = item.get("last_trade")
+                    if p is None:
+                        p = item.get("midpoint")
+                    if p is None:
+                        p = item.get("best_bid")
+                    if name and p is not None:
+                        try:
+                            prices[name] = float(p)
+                        except (ValueError, TypeError):
+                            pass
+            if prices:
+                return prices
+
+        # 2. Fallback: Gamma API
+        try:
+            import urllib.request
+            url = f"https://gamma-api.polymarket.com/events?slug={market_slug}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+                if data and isinstance(data, list):
+                    markets = data[0].get("markets", [])
+                    for m in markets:
+                        if m.get("slug") == market_slug or len(markets) == 1:
+                            out_names = json.loads(m.get("outcomes", "[]")) if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
+                            out_prices = json.loads(m.get("outcomePrices", "[]")) if isinstance(m.get("outcomePrices"), str) else m.get("outcomePrices", [])
+                            for name, pr_str in zip(out_names, out_prices):
+                                try:
+                                    prices[name] = float(pr_str)
+                                except (ValueError, TypeError):
+                                    pass
+        except Exception:
+            pass
+
+        return prices
+
     def list_copy_subscriptions(self) -> Dict[str, Any]:
         """
         Lists all active copy trading subscriptions from Bullpen tracker.

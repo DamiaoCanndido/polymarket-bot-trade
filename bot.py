@@ -89,6 +89,8 @@ def cmd_status(args, config: BotConfig):
     summary_table.add_row("[bold]Faixa de Preço Permitida:[/bold]", f"${config.risk.min_price:.2f} - ${config.risk.max_price:.2f}")
     summary_table.add_row("[bold]Tolerância de Slippage:[/bold]", f"{config.risk.slippage_tolerance_pct}%")
     summary_table.add_row("[bold]Venda Espelho Automática:[/bold]", str(config.risk.auto_exit_on_sell))
+    tp_str = f"[green]ATIVO[/green] (Preço >= ${config.risk.take_profit_price:.2f} ou Lucro >= +{config.risk.take_profit_min_gain_pct:.0f}%)" if getattr(config.risk, "auto_take_profit", True) else "[red]DESATIVADO[/red]"
+    summary_table.add_row("[bold]Auto Take-Profit (Lucro):[/bold]", tp_str)
     summary_table.add_row("[bold]Arquivo de Trades (JSONL):[/bold]", f"[cyan]{config.trades_log_file}[/cyan]")
     summary_table.add_row("[bold]Arquivo de Estado (JSON):[/bold]", f"[cyan]{config.portfolio_state_file}[/cyan]")
     console.print(Panel(summary_table, title="[bold]⚙️ Configurações de Risco & Parâmetros[/bold]", border_style="blue"))

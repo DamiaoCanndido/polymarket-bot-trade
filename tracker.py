@@ -557,9 +557,156 @@ class CopyTracker:
             "current_mode": "paper" if self.config.dry_run else "live"
         }
 
+    def check_auto_take_profit(self) -> List[Dict[str, Any]]:
+        """
+        Scans all open positions in the active mode portfolio.
+        If a position meets the Auto Take-Profit criteria (price target or min gain %),
+        triggers an automatic SELL to lock in profits without waiting for the master trader.
+        """
+        if not getattr(self.config.risk, "auto_take_profit", True):
+            return []
+
+        mode = "paper" if self.config.dry_run else "live"
+        mode_port = self.portfolio.get(mode, {})
+        positions = mode_port.get("positions", {})
+        if not positions:
+            return []
+
+        tp_price_target = float(getattr(self.config.risk, "take_profit_price", 0.90))
+        tp_min_gain_pct = float(getattr(self.config.risk, "take_profit_min_gain_pct", 20.0))
+
+        executed_tps = []
+        keys_to_close = []
+
+        for pos_key, pos in list(positions.items()):
+            market_slug = pos.get("market_slug")
+            outcome = pos.get("outcome")
+            shares = float(pos.get("shares", 0.0))
+            avg_price = float(pos.get("avg_price", 0.50))
+            total_cost = float(pos.get("total_cost", 0.0))
+            market_title = pos.get("market_title", market_slug)
+            market_url = pos.get("market_url", "")
+
+            if shares <= 0.0001 or not market_slug or not outcome:
+                continue
+
+            try:
+                live_prices = self.executor.get_market_prices(market_slug)
+                current_price = live_prices.get(outcome)
+
+                if current_price is None or current_price <= 0:
+                    continue
+
+                gain_pct = ((current_price - avg_price) / avg_price * 100.0) if avg_price > 0 else 0.0
+                
+                # Check criteria:
+                # 1. Price is at or above target (e.g. >= 0.90) and profitable
+                # 2. Or Gain % is above min gain threshold and current price > avg price
+                is_target_price = (current_price >= tp_price_target and current_price > avg_price)
+                is_target_gain = (tp_min_gain_pct > 0 and gain_pct >= tp_min_gain_pct and current_price > avg_price)
+
+                if is_target_price or is_target_gain:
+                    gross_usd_value = shares * current_price
+                    realized_pnl = gross_usd_value - total_cost
+
+                    logger.info(
+                        f"🎯 AUTO TAKE-PROFIT Triggered [{mode.upper()}]: {outcome} on '{market_slug}' | "
+                        f"Current: ${current_price:.3f} (Entry: ${avg_price:.3f} | +{gain_pct:.1f}%) | Realized PnL: +${realized_pnl:.2f}"
+                    )
+
+                    event_id = str(uuid.uuid4())
+                    timestamp_now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                    log_entry = {
+                        "event_id": event_id,
+                        "timestamp": timestamp_now,
+                        "trade_id": f"tp_{event_id[:8]}",
+                        "transaction_hash": None,
+                        "master_trader": {
+                            "address": "bot_auto_take_profit",
+                            "name": "Auto Take-Profit",
+                            "category": "System",
+                            "risk_tier": "low",
+                            "style": "profit_taker"
+                        },
+                        "market": {
+                            "slug": market_slug,
+                            "title": market_title,
+                            "url": market_url,
+                            "outcome": outcome
+                        },
+                        "master_trade": {
+                            "side": "SELL",
+                            "price": current_price,
+                            "size_usd": gross_usd_value,
+                            "shares": shares,
+                            "timestamp": timestamp_now
+                        },
+                        "bot_execution": {
+                            "action": "SELL",
+                            "amount_usd": gross_usd_value,
+                            "shares": shares,
+                            "price": current_price,
+                            "proportional_fraction": 1.0,
+                            "mode": mode,
+                            "status": "EXECUTED",
+                            "reason": f"🎯 Auto Take-Profit: Realizou lucro de +${realized_pnl:.2f} (+{gain_pct:.1f}%) a ${current_price:.3f} sem esperar o mestre."
+                        },
+                        "error": None,
+                        "portfolio_metrics": {}
+                    }
+
+                    if mode == "paper":
+                        mode_port["cash_usd"] += gross_usd_value
+                        mode_port["realized_pnl_usd"] = mode_port.get("realized_pnl_usd", 0.0) + realized_pnl
+                        mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+                        mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
+                        self.risk_manager.record_trade_execution(market_slug, gross_usd_value, "sell", mode="paper")
+                        keys_to_close.append(pos_key)
+                    else:
+                        # Live sell execution via Bullpen CLI
+                        min_allowed_price = current_price * (1.0 - (self.config.risk.slippage_tolerance_pct / 100.0))
+                        res = self.executor.execute_sell(
+                            market_slug=market_slug,
+                            outcome=outcome,
+                            shares=shares,
+                            sell_all=True,
+                            min_price=min_allowed_price
+                        )
+                        if not res.get("success"):
+                            logger.error(f"Failed to execute live Auto Take-Profit sell: {res.get('error')}")
+                            log_entry["bot_execution"]["status"] = "FAILED"
+                            log_entry["bot_execution"]["reason"] = f"Live sell failed: {res.get('error')}"
+                            log_entry["error"] = str(res.get("error"))
+                            mode_port["failed_trades"] = mode_port.get("failed_trades", 0) + 1
+                            mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
+                        else:
+                            mode_port["cash_usd"] += gross_usd_value
+                            mode_port["realized_pnl_usd"] = mode_port.get("realized_pnl_usd", 0.0) + realized_pnl
+                            mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+                            mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
+                            self.risk_manager.record_trade_execution(market_slug, gross_usd_value, "sell", mode="live")
+                            keys_to_close.append(pos_key)
+
+                    log_entry["portfolio_metrics"] = self._get_portfolio_metrics(mode)
+                    self._log_trade_record(log_entry)
+                    executed_tps.append(log_entry)
+
+            except Exception as e:
+                logger.error(f"Error evaluating Auto Take-Profit for {pos_key}: {e}")
+
+        for k in keys_to_close:
+            if k in mode_port.get("positions", {}):
+                del mode_port["positions"][k]
+
+        if executed_tps:
+            self._save_portfolio_state()
+
+        return executed_tps
+
     def poll_cycle(self) -> List[Dict[str, Any]]:
         """
-        Runs a single poll cycle across all active master traders.
+        Runs a single poll cycle across all active master traders and checks auto take-profit.
         Catches any feed or execution errors to ensure uninterrupted looping.
         """
         if not self._seeded:
@@ -567,6 +714,8 @@ class CopyTracker:
             self._seeded = True
 
         results = []
+
+        # 1. Process Master Trader Feeds
         for trader in self.config.traders:
             if not trader.enabled:
                 continue
@@ -580,7 +729,6 @@ class CopyTracker:
                             results.append(res)
                     except Exception as trade_err:
                         logger.error(f"Unhandled error processing trade from {trader.name}: {trade_err}")
-                        # Fallback error logging to JSONL
                         self._log_trade_record({
                             "event_id": str(uuid.uuid4()),
                             "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -592,5 +740,13 @@ class CopyTracker:
                         })
             except Exception as feed_err:
                 logger.error(f"Error fetching trade feed for trader {trader.name} ({trader.address}): {feed_err}")
+
+        # 2. Check and Execute Auto Take-Profit on Profitable Open Positions
+        try:
+            tp_results = self.check_auto_take_profit()
+            for tp in tp_results:
+                results.append({"status": "EXECUTED", "reason": tp["bot_execution"]["reason"], "details": tp})
+        except Exception as tp_err:
+            logger.error(f"Error checking Auto Take-Profit: {tp_err}")
 
         return results

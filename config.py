@@ -42,6 +42,9 @@ class RiskConfig:
     max_price: float = 0.95  # Avoid extreme heavy favorites (> 95c)
     min_hours_to_resolution: float = 1.0  # Avoid markets expiring in minutes
     auto_exit_on_sell: bool = True  # Mirror sell orders from master traders
+    auto_take_profit: bool = True  # Automatically sell profitable positions without waiting for master
+    take_profit_price: float = 0.90  # Target price (0.0 - 1.0) to auto-trigger exit with profit
+    take_profit_min_gain_pct: float = 20.0  # Minimum gain % to qualify for profit exit (e.g. 20%)
 
 
 TRADES_LOG_FILE = os.path.join(os.path.dirname(__file__), "trades_log.jsonl")
@@ -154,6 +157,18 @@ def load_config(path: str = CONFIG_FILE_PATH) -> BotConfig:
     if "POLL_INTERVAL_SECONDS" in os.environ:
         try:
             cfg.poll_interval_seconds = int(os.environ["POLL_INTERVAL_SECONDS"])
+        except ValueError:
+            pass
+    if "AUTO_TAKE_PROFIT" in os.environ:
+        cfg.risk.auto_take_profit = os.environ["AUTO_TAKE_PROFIT"].strip().lower() in ("true", "1", "yes")
+    if "TAKE_PROFIT_PRICE" in os.environ:
+        try:
+            cfg.risk.take_profit_price = float(os.environ["TAKE_PROFIT_PRICE"])
+        except ValueError:
+            pass
+    if "TAKE_PROFIT_MIN_GAIN_PCT" in os.environ:
+        try:
+            cfg.risk.take_profit_min_gain_pct = float(os.environ["TAKE_PROFIT_MIN_GAIN_PCT"])
         except ValueError:
             pass
 

@@ -21,7 +21,10 @@
     "min_price": 0.05,
     "max_price": 0.95,
     "min_hours_to_resolution": 1.0,
-    "auto_exit_on_sell": true
+    "auto_exit_on_sell": true,
+    "auto_take_profit": true,
+    "take_profit_price": 0.9,
+    "take_profit_min_gain_pct": 20.0
   },
   "traders": [
     {
@@ -267,9 +270,9 @@
     {
       "address": "0xfedc381bf3fb5d20433bb4a0216b15dbbc5c6398",
       "name": "0xfedc...6398",
-      "win_rate_7d": 0.6923076923076923,
-      "pnl_7d": 42580.298953287886,
-      "volume_7d": 4720.442799,
+      "win_rate_7d": 0.8085106382978723,
+      "pnl_7d": 42648.71957385944,
+      "volume_7d": 1937.8282889999996,
       "category": "Sports",
       "risk_tier": "low",
       "style": "high_conviction",
