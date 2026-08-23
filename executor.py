@@ -48,6 +48,31 @@ class CopyExecutor:
         """
         return self._run_cli(["polymarket", "positions"])
 
+    def get_wallet_balance(self) -> Dict[str, Any]:
+        """
+        Queries Bullpen CLI for on-chain/CLOB balance and wallet address.
+        """
+        res = self._run_cli(["polymarket", "preflight"])
+        if res.get("success"):
+            wallet_addr = res.get("wallet_address") or ""
+            bal_str = str(res.get("balance_usd") or res.get("wallet_balance_usd") or "$0.00")
+            bal_clean = bal_str.replace("$", "").replace(",", "").strip()
+            try:
+                bal_float = float(bal_clean)
+            except ValueError:
+                try:
+                    bal_float = float(res.get("balance") or 0.0)
+                except ValueError:
+                    bal_float = 0.0
+            return {
+                "success": True,
+                "address": wallet_addr,
+                "balance_usd": bal_float,
+                "allowance_usd": res.get("allowance_usd", "Unlimited"),
+                "approvals_ok": res.get("approvals_ok", True)
+            }
+        return {"success": False, "error": res.get("error", "Failed to query wallet balance"), "balance_usd": 0.0}
+
     def list_copy_subscriptions(self) -> Dict[str, Any]:
         """
         Lists all active copy trading subscriptions from Bullpen tracker.

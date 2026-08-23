@@ -339,6 +339,26 @@ def cmd_dashboard(args, config: BotConfig):
     run_dashboard(host=args.host, port=args.port)
 
 
+def cmd_sync_wallet(args, config: BotConfig):
+    console.print("[bold cyan]Consultando saldo on-chain da carteira real via Bullpen...[/bold cyan]")
+    risk_mgr = RiskManager(config.risk)
+    executor = CopyExecutor(config, risk_mgr)
+    tracker = CopyTracker(config, executor, risk_mgr)
+    info = executor.get_wallet_balance()
+    if info.get("success"):
+        bal = float(info.get("balance_usd", 0.0))
+        addr = info.get("address", "")
+        config.live_initial_cash_usd = bal
+        save_config(config)
+        if "live" in tracker.portfolio:
+            tracker.portfolio["live"]["cash_usd"] = bal
+            tracker.portfolio["live"]["initial_cash_usd"] = bal
+            tracker._save_portfolio_state()
+        console.print(f"[bold green]✓ Saldo da Carteira ({addr}) sincronizado com sucesso: ${bal:,.2f} USDC (Polygon)[/bold green]")
+    else:
+        console.print(f"[bold red]✗ Erro ao consultar carteira: {info.get('error')}[/bold red]")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Polymarket Copytrading Bot")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
@@ -356,6 +376,9 @@ def main():
 
     # status
     p_status = subparsers.add_parser("status", help="Show current bot status and master trader roster")
+
+    # sync-wallet
+    p_sync = subparsers.add_parser("sync-wallet", help="Sync on-chain wallet balance from Polygon into bot live state")
 
     # portfolio
     p_port = subparsers.add_parser("portfolio", help="Show current open positions and equity")
@@ -383,6 +406,8 @@ def main():
         cmd_scan(args, config)
     elif args.command == "status":
         cmd_status(args, config)
+    elif args.command == "sync-wallet":
+        cmd_sync_wallet(args, config)
     elif args.command == "portfolio":
         cmd_portfolio(args, config)
     elif args.command == "logs":

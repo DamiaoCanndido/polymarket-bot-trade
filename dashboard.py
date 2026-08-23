@@ -81,6 +81,31 @@ class BotRunnerManager:
             self.executor = CopyExecutor(self.config, self.risk_manager)
             self.tracker = CopyTracker(self.config, self.executor, self.risk_manager)
 
+    def get_wallet_info(self) -> Dict[str, Any]:
+        return self.executor.get_wallet_balance()
+
+    def sync_live_wallet_balance(self) -> Dict[str, Any]:
+        with self.lock:
+            info = self.executor.get_wallet_balance()
+            if info.get("success"):
+                bal = float(info.get("balance_usd", 0.0))
+                wallet_addr = info.get("address", "")
+                self.config.live_initial_cash_usd = bal
+                save_config(self.config)
+                if "live" in self.tracker.portfolio:
+                    self.tracker.portfolio["live"]["cash_usd"] = bal
+                    self.tracker.portfolio["live"]["initial_cash_usd"] = bal
+                    self.tracker._save_portfolio_state()
+                display_addr = f"{wallet_addr[:6]}...{wallet_addr[-4:]}" if len(wallet_addr) >= 10 else wallet_addr
+                self.log_activity("success", f"💰 Saldo da carteira real ({display_addr}) sincronizado: ${bal:,.2f}")
+                return {
+                    "success": True,
+                    "balance_usd": bal,
+                    "address": wallet_addr,
+                    "message": f"Saldo sincronizado com sucesso: ${bal:,.2f}"
+                }
+            return {"success": False, "error": info.get("error", "Falha ao consultar carteira"), "balance_usd": 0.0}
+
     def start(self, mode: Optional[str] = None) -> Dict[str, Any]:
         with self.lock:
             if self.is_running:
@@ -526,6 +551,18 @@ def api_traders_scan():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/wallet/info", methods=["GET"])
+def api_wallet_info():
+    info = bot_manager.get_wallet_info()
+    return jsonify(info)
+
+
+@app.route("/api/wallet/sync", methods=["POST"])
+def api_wallet_sync():
+    res = bot_manager.sync_live_wallet_balance()
+    return jsonify(res)
+
+
 @app.route("/api/config/update", methods=["POST"])
 def api_config_update():
     data = request.get_json(silent=True) or {}
@@ -536,7 +573,13 @@ def api_config_update():
     if "paper_initial_cash_usd" in data:
         cfg.paper_initial_cash_usd = float(data["paper_initial_cash_usd"])
     if "live_initial_cash_usd" in data:
-        cfg.live_initial_cash_usd = float(data["live_initial_cash_usd"])
+        new_live_cash = float(data["live_initial_cash_usd"])
+        cfg.live_initial_cash_usd = new_live_cash
+        if hasattr(bot_manager, "tracker") and "live" in bot_manager.tracker.portfolio:
+            bot_manager.tracker.portfolio["live"]["initial_cash_usd"] = new_live_cash
+            if bot_manager.tracker.portfolio["live"].get("cash_usd", 0.0) == 0.0 or bot_manager.tracker.portfolio["live"].get("total_trades_count", 0) == 0:
+                bot_manager.tracker.portfolio["live"]["cash_usd"] = new_live_cash
+            bot_manager.tracker._save_portfolio_state()
     if "fixed_amount_usd" in data:
         cfg.sizing.fixed_amount_usd = float(data["fixed_amount_usd"])
     if "daily_budget_usd" in data:
@@ -548,8 +591,8 @@ def api_config_update():
 
     save_config(cfg)
     bot_manager.reload_config()
-    bot_manager.log_activity("info", "⚙️ Configuration & risk limits updated.")
-    return jsonify({"success": True, "message": "Configuration updated successfully."})
+    bot_manager.log_activity("info", "⚙️ Configurações e limites de risco atualizados.")
+    return jsonify({"success": True, "message": "Configurações salvas com sucesso."})
 
 
 # =====================================================================
@@ -730,7 +773,7 @@ DASHBOARD_HTML = """
                 <h3 class="text-sm font-bold text-white">Dinheiro Real (Live Trading)</h3>
                 <span id="pill-active-live" class="hidden px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500 text-gray-950">ATIVO NA TELA</span>
               </div>
-              <p class="text-xs text-gray-400">Operações reais na sua carteira Polymarket</p>
+              <p class="text-xs text-gray-400">Carteira: <span class="font-mono text-emerald-400" title="0xcc78a24c4856c0f195ad26354d549255b5f2ab18">0xcc78...ab18</span> (Polygon)</p>
             </div>
           </div>
           <div class="text-right">
@@ -741,7 +784,12 @@ DASHBOARD_HTML = """
         <div class="mt-3 pt-2.5 border-t border-gray-800 flex items-center justify-between text-xs text-gray-400 font-mono">
           <span>Trades: <strong id="mini-trades-live" class="text-white">0</strong></span>
           <span>Taxa de Acerto: <strong id="mini-wr-live" class="text-emerald-400">0.0%</strong></span>
-          <span>Caixa: <strong id="mini-cash-live" class="text-gray-300">$0.00</strong></span>
+          <div class="flex items-center gap-2">
+            <span>Caixa: <strong id="mini-cash-live" class="text-gray-300">$0.00</strong></span>
+            <button onclick="event.stopPropagation(); syncWalletBalance();" class="px-2 py-0.5 rounded bg-emerald-950 hover:bg-emerald-900 border border-emerald-700 text-emerald-300 font-sans text-[11px] flex items-center gap-1 font-semibold transition" title="Sincronizar saldo da carteira on-chain (Polygon)">
+              <span>🔄</span> Sincronizar
+            </button>
+          </div>
         </div>
       </div>
 
@@ -1136,8 +1184,13 @@ DASHBOARD_HTML = """
               <input type="number" step="10" id="cfg-paper-cash" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="1000.0">
             </div>
             <div>
-              <label class="block text-gray-400 mb-1">Saldo Inicial Real (USD)</label>
-              <input type="number" step="10" id="cfg-live-cash" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="0.0">
+              <div class="flex items-center justify-between mb-1">
+                <label class="block text-gray-400">Saldo Inicial Real (USD)</label>
+                <button type="button" onclick="syncWalletBalance()" class="text-[11px] text-emerald-400 hover:text-emerald-300 flex items-center gap-1 font-semibold">
+                  <span>🔄</span> Sincronizar On-chain
+                </button>
+              </div>
+              <input type="number" step="1" id="cfg-live-cash" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="0.0">
             </div>
           </div>
           <div class="pt-2">
@@ -1495,6 +1548,25 @@ DASHBOARD_HTML = """
         saveBtn.innerHTML = '<span>Salvar Configurações</span>';
       }
       refreshAllData();
+    }
+
+    // Sincronizar Saldo On-chain da Carteira Real via Bullpen
+    async function syncWalletBalance() {
+      showToast('Carteira', 'Consultando saldo on-chain na rede Polygon...', 'info');
+      try {
+        const res = await fetch('/api/wallet/sync', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          showToast('Saldo Atualizado', `Saldo da carteira real: $${data.balance_usd.toFixed(2)} (Polygon)`, 'success');
+          const cfgLive = document.getElementById('cfg-live-cash');
+          if (cfgLive) cfgLive.value = data.balance_usd;
+          refreshAllData();
+        } else {
+          showToast('Aviso', data.error || 'Não foi possível ler o saldo da carteira', 'warning');
+        }
+      } catch (err) {
+        showToast('Erro', 'Falha ao sincronizar carteira: ' + err.message, 'error');
+      }
     }
 
     // Filter trades
