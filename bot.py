@@ -361,6 +361,17 @@ def cmd_sync_wallet(args, config: BotConfig):
         console.print(f"[bold red]✗ Erro ao consultar carteira: {info.get('error')}[/bold red]")
 
 
+def cmd_close_position(args, config: BotConfig):
+    risk_mgr = RiskManager(config.risk)
+    executor = CopyExecutor(config, risk_mgr)
+    tracker = CopyTracker(config, executor, risk_mgr)
+    res = tracker.manual_close_position(args.position_key, mode=args.mode)
+    if res.get("success"):
+        console.print(f"[bold green]✓ {res.get('message')}[/bold green]")
+    else:
+        console.print(f"[bold red]✗ {res.get('error')}[/bold red]")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Polymarket Copytrading Bot")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
@@ -381,6 +392,11 @@ def main():
 
     # sync-wallet
     p_sync = subparsers.add_parser("sync-wallet", help="Sync on-chain wallet balance from Polygon into bot live state")
+
+    # close-position
+    p_close = subparsers.add_parser("close-position", help="Manually close and liquidate an open position")
+    p_close.add_argument("position_key", help="Position key to close (e.g. market_slug:Outcome)")
+    p_close.add_argument("--mode", default=None, choices=["paper", "live"], help="Portfolio mode (paper or live)")
 
     # portfolio
     p_port = subparsers.add_parser("portfolio", help="Show current open positions and equity")
@@ -410,6 +426,8 @@ def main():
         cmd_status(args, config)
     elif args.command == "sync-wallet":
         cmd_sync_wallet(args, config)
+    elif args.command == "close-position":
+        cmd_close_position(args, config)
     elif args.command == "portfolio":
         cmd_portfolio(args, config)
     elif args.command == "logs":

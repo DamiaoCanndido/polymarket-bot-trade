@@ -590,6 +590,9 @@ def api_config_get():
         "auto_take_profit": getattr(cfg.risk, "auto_take_profit", True),
         "take_profit_price": getattr(cfg.risk, "take_profit_price", 0.90),
         "take_profit_min_gain_pct": getattr(cfg.risk, "take_profit_min_gain_pct", 20.0),
+        "auto_stop_loss": getattr(cfg.risk, "auto_stop_loss", True),
+        "stop_loss_price": getattr(cfg.risk, "stop_loss_price", 0.05),
+        "stop_loss_max_loss_pct": getattr(cfg.risk, "stop_loss_max_loss_pct", 85.0),
     })
 
 
@@ -624,11 +627,29 @@ def api_config_update():
         cfg.risk.take_profit_price = float(data["take_profit_price"])
     if "take_profit_min_gain_pct" in data:
         cfg.risk.take_profit_min_gain_pct = float(data["take_profit_min_gain_pct"])
+    if "auto_stop_loss" in data:
+        cfg.risk.auto_stop_loss = bool(data["auto_stop_loss"])
+    if "stop_loss_price" in data:
+        cfg.risk.stop_loss_price = float(data["stop_loss_price"])
+    if "stop_loss_max_loss_pct" in data:
+        cfg.risk.stop_loss_max_loss_pct = float(data["stop_loss_max_loss_pct"])
 
     save_config(cfg)
     bot_manager.reload_config()
-    bot_manager.log_activity("info", "⚙️ Configurações e limites de risco atualizados.")
+    bot_manager.log_activity("info", "⚙️ Configurações de risco (Take-Profit & Stop-Loss) atualizadas.")
     return jsonify({"success": True, "message": "Configurações salvas com sucesso."})
+
+
+@app.route("/api/positions/close", methods=["POST"])
+def api_position_close():
+    data = request.get_json(silent=True) or {}
+    pos_key = data.get("position_key")
+    mode = data.get("mode")
+    if not pos_key:
+        return jsonify({"success": False, "error": "Parâmetro 'position_key' obrigatório."}), 400
+    res = bot_manager.tracker.manual_close_position(pos_key, mode=mode)
+    bot_manager.log_activity("info", f"👋 Posição '{pos_key}' liquidada manualmente.")
+    return jsonify(res)
 
 
 # =====================================================================
@@ -1127,11 +1148,12 @@ DASHBOARD_HTML = """
                 <th class="px-4 py-3 text-right">Preço Médio</th>
                 <th class="px-4 py-3 text-right">Custo Total</th>
                 <th class="px-4 py-3 text-right">Valor Estimado</th>
+                <th class="px-4 py-3 text-center">Ação</th>
               </tr>
             </thead>
             <tbody id="positions-tbody" class="divide-y divide-gray-800">
               <tr>
-                <td colspan="6" class="px-4 py-8 text-center text-gray-500">
+                <td colspan="7" class="px-4 py-8 text-center text-gray-500">
                   Nenhuma posição aberta no momento.
                 </td>
               </tr>
@@ -1254,6 +1276,33 @@ DASHBOARD_HTML = """
                 <label class="block text-gray-400 mb-1">Lucro Mínimo Alvo (%)</label>
                 <input type="number" step="1" min="0" id="cfg-tp-gain" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="20.0" title="Vende se o lucro passar desta porcentagem">
                 <span class="text-[10px] text-gray-500">Ex: 20% de lucro</span>
+              </div>
+            </div>
+          </div>
+          <!-- Auto Stop-Loss Card -->
+          <div class="p-3.5 bg-rose-950/20 border border-rose-800/60 rounded-lg space-y-3">
+            <div class="flex items-center justify-between">
+              <div>
+                <label class="font-bold text-rose-400 flex items-center gap-1.5 text-xs">
+                  <span>🛑</span> Auto Stop-Loss & Limpeza de Mercados Encerrados
+                </label>
+                <p class="text-[11px] text-gray-400 mt-0.5">Encerra e liquida automaticamente posições perdedoras ou resolvidas quando o preço despenca.</p>
+              </div>
+              <label class="relative inline-flex items-center cursor-pointer">
+                <input type="checkbox" id="cfg-auto-sl" class="sr-only peer" checked>
+                <div class="w-9 h-5 bg-gray-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-rose-600"></div>
+              </label>
+            </div>
+            <div class="grid grid-cols-2 gap-3 pt-1">
+              <div>
+                <label class="block text-gray-400 mb-1">Preço Gatilho de Stop (USD)</label>
+                <input type="number" step="0.01" min="0.01" max="0.50" id="cfg-sl-price" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="0.05" title="Encerra se o preço cair para este valor ou menos (ex: 0.05 = 5¢)">
+                <span class="text-[10px] text-gray-500">Ex: 0.05 (encerra a 5¢ ou menos)</span>
+              </div>
+              <div>
+                <label class="block text-gray-400 mb-1">Prejuízo Máximo Tolerado (%)</label>
+                <input type="number" step="1" min="10" max="99" id="cfg-sl-loss" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="85.0" title="Encerra se o prejuízo ultrapassar esta porcentagem">
+                <span class="text-[10px] text-gray-500">Ex: 85% de prejuízo</span>
               </div>
             </div>
           </div>
@@ -1599,7 +1648,10 @@ DASHBOARD_HTML = """
         live_initial_cash_usd: parseFloat(document.getElementById('cfg-live-cash').value),
         auto_take_profit: document.getElementById('cfg-auto-tp') ? document.getElementById('cfg-auto-tp').checked : true,
         take_profit_price: parseFloat(document.getElementById('cfg-tp-price').value || 0.90),
-        take_profit_min_gain_pct: parseFloat(document.getElementById('cfg-tp-gain').value || 20.0)
+        take_profit_min_gain_pct: parseFloat(document.getElementById('cfg-tp-gain').value || 20.0),
+        auto_stop_loss: document.getElementById('cfg-auto-sl') ? document.getElementById('cfg-auto-sl').checked : true,
+        stop_loss_price: parseFloat(document.getElementById('cfg-sl-price').value || 0.05),
+        stop_loss_max_loss_pct: parseFloat(document.getElementById('cfg-sl-loss').value || 85.0)
       };
 
       try {
@@ -1608,7 +1660,7 @@ DASHBOARD_HTML = """
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        showToast('⚙️ Configurações Salvas', 'Limites de risco, saldos e Auto Take-Profit atualizados com sucesso.', 'success');
+        showToast('⚙️ Configurações Salvas', 'Limites de risco, Take-Profit e Stop-Loss atualizados com sucesso.', 'success');
       } catch (err) {
         showToast('Erro', 'Falha ao salvar configurações: ' + err.message, 'error');
       } finally {
@@ -1633,6 +1685,9 @@ DASHBOARD_HTML = """
           if (document.getElementById('cfg-auto-tp') && data.auto_take_profit !== undefined) document.getElementById('cfg-auto-tp').checked = data.auto_take_profit;
           if (document.getElementById('cfg-tp-price') && data.take_profit_price !== undefined) document.getElementById('cfg-tp-price').value = data.take_profit_price;
           if (document.getElementById('cfg-tp-gain') && data.take_profit_min_gain_pct !== undefined) document.getElementById('cfg-tp-gain').value = data.take_profit_min_gain_pct;
+          if (document.getElementById('cfg-auto-sl') && data.auto_stop_loss !== undefined) document.getElementById('cfg-auto-sl').checked = data.auto_stop_loss;
+          if (document.getElementById('cfg-sl-price') && data.stop_loss_price !== undefined) document.getElementById('cfg-sl-price').value = data.stop_loss_price;
+          if (document.getElementById('cfg-sl-loss') && data.stop_loss_max_loss_pct !== undefined) document.getElementById('cfg-sl-loss').value = data.stop_loss_max_loss_pct;
         }
       } catch (err) {
         console.error('Failed to load settings:', err);
@@ -1830,7 +1885,7 @@ DASHBOARD_HTML = """
         if (posCountEl) posCountEl.innerText = keys.length;
 
         if (keys.length === 0) {
-          tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-8 text-center text-gray-500">Nenhuma posição aberta no modo ${viewMode.toUpperCase()}.</td></tr>`;
+          tbody.innerHTML = `<tr><td colspan="7" class="px-4 py-8 text-center text-gray-500">Nenhuma posição aberta no modo ${viewMode.toUpperCase()}.</td></tr>`;
           return;
         }
 
@@ -1856,12 +1911,41 @@ DASHBOARD_HTML = """
               <td class="px-4 py-3 text-right font-mono text-gray-300">$${(p.avg_price || 0).toFixed(3)}</td>
               <td class="px-4 py-3 text-right font-mono text-gray-300 font-bold">$${(p.total_cost || 0).toFixed(2)}</td>
               <td class="px-4 py-3 text-right font-mono text-emerald-400 font-bold">$${val.toFixed(2)}</td>
+              <td class="px-4 py-3 text-center whitespace-nowrap">
+                <button onclick="closePosition('${k}')" class="px-2.5 py-1 text-[11px] font-bold rounded bg-rose-950 hover:bg-rose-900 text-rose-300 border border-rose-800 transition inline-flex items-center gap-1" title="Encerrar/Liquidar Posição">
+                  <span>🛑</span> Liquidar
+                </button>
+              </td>
             </tr>
           `;
         }).join('');
       } catch (e) {
         console.error('Error loading positions:', e);
       }
+    }
+
+    // Close / Liquidate Position Manually
+    async function closePosition(posKey) {
+      if (!confirm(`Deseja realmente liquidar e encerrar a posição "${posKey}" no modo ${viewMode.toUpperCase()}?`)) {
+        return;
+      }
+      showToast('Posição', `Liquidando posição ${posKey}...`, 'info');
+      try {
+        const res = await fetch('/api/positions/close', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ position_key: posKey, mode: viewMode })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast('Posição Liquidada', data.message || 'Posição encerrada com sucesso.', 'success');
+        } else {
+          showToast('Erro', data.error || 'Falha ao encerrar posição', 'error');
+        }
+      } catch (err) {
+        showToast('Erro', 'Falha ao liquidar posição: ' + err.message, 'error');
+      }
+      refreshAllData();
     }
 
     // Load Master Traders List

@@ -24,7 +24,10 @@
     "auto_exit_on_sell": true,
     "auto_take_profit": true,
     "take_profit_price": 0.9,
-    "take_profit_min_gain_pct": 20.0
+    "take_profit_min_gain_pct": 20.0,
+    "auto_stop_loss": true,
+    "stop_loss_price": 0.05,
+    "stop_loss_max_loss_pct": 85.0
   },
   "traders": [
     {

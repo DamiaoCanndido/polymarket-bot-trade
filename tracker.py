@@ -704,9 +704,259 @@ class CopyTracker:
 
         return executed_tps
 
+    def check_auto_stop_loss(self) -> List[Dict[str, Any]]:
+        """
+        Scans all open positions in the active mode portfolio.
+        If a position meets the Stop-Loss / Market Resolution criteria (e.g. price <= 0.05 or loss >= 85%),
+        automatically closes and liquidates the position to clear dead/resolved markets.
+        """
+        if not getattr(self.config.risk, "auto_stop_loss", True):
+            return []
+
+        mode = "paper" if self.config.dry_run else "live"
+        mode_port = self.portfolio.get(mode, {})
+        positions = mode_port.get("positions", {})
+        if not positions:
+            return []
+
+        sl_price_trigger = float(getattr(self.config.risk, "stop_loss_price", 0.05))
+        sl_max_loss_pct = float(getattr(self.config.risk, "stop_loss_max_loss_pct", 85.0))
+
+        executed_sls = []
+        keys_to_close = []
+
+        for pos_key, pos in list(positions.items()):
+            market_slug = pos.get("market_slug")
+            outcome = pos.get("outcome")
+            shares = float(pos.get("shares", 0.0))
+            avg_price = float(pos.get("avg_price", 0.50))
+            total_cost = float(pos.get("total_cost", 0.0))
+            market_title = pos.get("market_title", market_slug)
+            market_url = pos.get("market_url", "")
+
+            if shares <= 0.0001 or not market_slug or not outcome:
+                continue
+
+            try:
+                live_prices = self.executor.get_market_prices(market_slug)
+                current_price = live_prices.get(outcome)
+
+                if current_price is None:
+                    continue
+
+                current_price = max(0.0, float(current_price))
+                loss_pct = ((avg_price - current_price) / avg_price * 100.0) if avg_price > 0 else 0.0
+
+                # Check Stop-Loss / Resolution criteria:
+                # 1. Price is at or below trigger (e.g. <= 0.05 or 5 cents) and in loss
+                # 2. Or Loss % exceeds threshold (e.g. >= 85%) and price < avg_price
+                is_sl_price = (current_price <= sl_price_trigger and current_price < avg_price)
+                is_sl_loss = (sl_max_loss_pct > 0 and loss_pct >= sl_max_loss_pct and current_price < avg_price)
+
+                if is_sl_price or is_sl_loss:
+                    gross_usd_value = shares * current_price
+                    realized_pnl = gross_usd_value - total_cost
+
+                    logger.info(
+                        f"🛑 AUTO STOP-LOSS / RESOLUTION Triggered [{mode.upper()}]: {outcome} on '{market_slug}' | "
+                        f"Current: ${current_price:.3f} (Entry: ${avg_price:.3f} | -{loss_pct:.1f}%) | Realized PnL: ${realized_pnl:.2f}"
+                    )
+
+                    event_id = str(uuid.uuid4())
+                    timestamp_now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                    log_entry = {
+                        "event_id": event_id,
+                        "timestamp": timestamp_now,
+                        "trade_id": f"sl_{event_id[:8]}",
+                        "transaction_hash": None,
+                        "master_trader": {
+                            "address": "bot_auto_stop_loss",
+                            "name": "Auto Stop-Loss",
+                            "category": "System",
+                            "risk_tier": "low",
+                            "style": "risk_manager"
+                        },
+                        "market": {
+                            "slug": market_slug,
+                            "title": market_title,
+                            "url": market_url,
+                            "outcome": outcome
+                        },
+                        "master_trade": {
+                            "side": "SELL",
+                            "price": current_price,
+                            "size_usd": gross_usd_value,
+                            "shares": shares,
+                            "timestamp": timestamp_now
+                        },
+                        "bot_execution": {
+                            "action": "SELL",
+                            "amount_usd": gross_usd_value,
+                            "shares": shares,
+                            "price": current_price,
+                            "proportional_fraction": 1.0,
+                            "mode": mode,
+                            "status": "EXECUTED",
+                            "reason": f"🛑 Auto Stop-Loss: Encerrou posição resolvida/perdedora ({outcome}) com Realized PnL: ${realized_pnl:.2f} (-{loss_pct:.1f}%) a ${current_price:.3f}."
+                        },
+                        "error": None,
+                        "portfolio_metrics": {}
+                    }
+
+                    if mode == "paper":
+                        mode_port["cash_usd"] += gross_usd_value
+                        mode_port["realized_pnl_usd"] = mode_port.get("realized_pnl_usd", 0.0) + realized_pnl
+                        mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+                        mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
+                        self.risk_manager.record_trade_execution(market_slug, gross_usd_value, "sell", mode="paper")
+                        keys_to_close.append(pos_key)
+                    else:
+                        # Live mode: sell if value > 0.005, else write off
+                        if current_price > 0.005:
+                            min_allowed_price = max(0.001, current_price * (1.0 - (self.config.risk.slippage_tolerance_pct / 100.0)))
+                            res = self.executor.execute_sell(
+                                market_slug=market_slug,
+                                outcome=outcome,
+                                shares=shares,
+                                sell_all=True,
+                                min_price=min_allowed_price
+                            )
+                            if res.get("success"):
+                                mode_port["cash_usd"] += gross_usd_value
+                                mode_port["realized_pnl_usd"] = mode_port.get("realized_pnl_usd", 0.0) + realized_pnl
+                                mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+                                mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
+                                self.risk_manager.record_trade_execution(market_slug, gross_usd_value, "sell", mode="live")
+                                keys_to_close.append(pos_key)
+                            else:
+                                mode_port["realized_pnl_usd"] = mode_port.get("realized_pnl_usd", 0.0) + realized_pnl
+                                mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+                                mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
+                                keys_to_close.append(pos_key)
+                        else:
+                            mode_port["realized_pnl_usd"] = mode_port.get("realized_pnl_usd", 0.0) + realized_pnl
+                            mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+                            mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
+                            keys_to_close.append(pos_key)
+
+                    log_entry["portfolio_metrics"] = self._get_portfolio_metrics(mode)
+                    self._log_trade_record(log_entry)
+                    executed_sls.append(log_entry)
+
+            except Exception as e:
+                logger.error(f"Error evaluating Auto Stop-Loss for {pos_key}: {e}")
+
+        for k in keys_to_close:
+            if k in mode_port.get("positions", {}):
+                del mode_port["positions"][k]
+
+        if executed_sls:
+            self._save_portfolio_state()
+
+        return executed_sls
+
+    def manual_close_position(self, pos_key: str, mode: Optional[str] = None) -> Dict[str, Any]:
+        """Manually closes and liquidates an open position in the specified or current mode."""
+        exec_mode = mode or ("paper" if self.config.dry_run else "live")
+        mode_port = self.portfolio.get(exec_mode, {})
+        positions = mode_port.get("positions", {})
+
+        if pos_key not in positions:
+            return {"success": False, "error": f"Posição '{pos_key}' não encontrada no portfólio {exec_mode.upper()}."}
+
+        pos = positions[pos_key]
+        market_slug = pos.get("market_slug")
+        outcome = pos.get("outcome")
+        shares = float(pos.get("shares", 0.0))
+        avg_price = float(pos.get("avg_price", 0.50))
+        total_cost = float(pos.get("total_cost", 0.0))
+        market_title = pos.get("market_title", market_slug)
+        market_url = pos.get("market_url", "")
+
+        current_price = 0.0
+        try:
+            live_prices = self.executor.get_market_prices(market_slug)
+            current_price = float(live_prices.get(outcome, 0.0) or 0.0)
+        except Exception:
+            current_price = 0.0
+
+        gross_usd_value = shares * current_price
+        realized_pnl = gross_usd_value - total_cost
+
+        event_id = str(uuid.uuid4())
+        timestamp_now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        log_entry = {
+            "event_id": event_id,
+            "timestamp": timestamp_now,
+            "trade_id": f"manual_{event_id[:8]}",
+            "transaction_hash": None,
+            "master_trader": {
+                "address": "user_manual_close",
+                "name": "Manual Liquidation",
+                "category": "User",
+                "risk_tier": "low",
+                "style": "manual"
+            },
+            "market": {
+                "slug": market_slug,
+                "title": market_title,
+                "url": market_url,
+                "outcome": outcome
+            },
+            "master_trade": {
+                "side": "SELL",
+                "price": current_price,
+                "size_usd": gross_usd_value,
+                "shares": shares,
+                "timestamp": timestamp_now
+            },
+            "bot_execution": {
+                "action": "SELL",
+                "amount_usd": gross_usd_value,
+                "shares": shares,
+                "price": current_price,
+                "proportional_fraction": 1.0,
+                "mode": exec_mode,
+                "status": "EXECUTED",
+                "reason": f"👋 Liquidação Manual: Encerrou posição ({outcome}) com Realized PnL: ${realized_pnl:.2f} a ${current_price:.3f}."
+            },
+            "error": None,
+            "portfolio_metrics": {}
+        }
+
+        if exec_mode == "paper":
+            mode_port["cash_usd"] += gross_usd_value
+            mode_port["realized_pnl_usd"] = mode_port.get("realized_pnl_usd", 0.0) + realized_pnl
+            mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+            mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
+            del mode_port["positions"][pos_key]
+        else:
+            if current_price > 0.005:
+                res = self.executor.execute_sell(market_slug=market_slug, outcome=outcome, shares=shares, sell_all=True)
+                if not res.get("success"):
+                    logger.warning(f"Live manual sell CLI returned warning/error: {res.get('error')}")
+            mode_port["cash_usd"] += gross_usd_value
+            mode_port["realized_pnl_usd"] = mode_port.get("realized_pnl_usd", 0.0) + realized_pnl
+            mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+            mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
+            del mode_port["positions"][pos_key]
+
+        log_entry["portfolio_metrics"] = self._get_portfolio_metrics(exec_mode)
+        self._log_trade_record(log_entry)
+        self._save_portfolio_state()
+
+        return {
+            "success": True,
+            "message": f"Posição '{pos_key}' liquidada com sucesso (PnL: ${realized_pnl:.2f}).",
+            "realized_pnl": realized_pnl,
+            "gross_usd_value": gross_usd_value
+        }
+
     def poll_cycle(self) -> List[Dict[str, Any]]:
         """
-        Runs a single poll cycle across all active master traders and checks auto take-profit.
+        Runs a single poll cycle across all active master traders and checks auto take-profit and stop-loss.
         Catches any feed or execution errors to ensure uninterrupted looping.
         """
         if not self._seeded:
@@ -748,5 +998,13 @@ class CopyTracker:
                 results.append({"status": "EXECUTED", "reason": tp["bot_execution"]["reason"], "details": tp})
         except Exception as tp_err:
             logger.error(f"Error checking Auto Take-Profit: {tp_err}")
+
+        # 3. Check and Execute Auto Stop-Loss / Cleanup on Losing/Resolved Positions
+        try:
+            sl_results = self.check_auto_stop_loss()
+            for sl in sl_results:
+                results.append({"status": "EXECUTED", "reason": sl["bot_execution"]["reason"], "details": sl})
+        except Exception as sl_err:
+            logger.error(f"Error checking Auto Stop-Loss: {sl_err}")
 
         return results

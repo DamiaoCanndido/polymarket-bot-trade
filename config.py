@@ -45,6 +45,9 @@ class RiskConfig:
     auto_take_profit: bool = True  # Automatically sell profitable positions without waiting for master
     take_profit_price: float = 0.90  # Target price (0.0 - 1.0) to auto-trigger exit with profit
     take_profit_min_gain_pct: float = 20.0  # Minimum gain % to qualify for profit exit (e.g. 20%)
+    auto_stop_loss: bool = True  # Automatically close losing or resolved positions
+    stop_loss_price: float = 0.05  # Trigger price (<= 0.05 or 5c) to close dead/losing markets
+    stop_loss_max_loss_pct: float = 85.0  # Trigger exit if loss exceeds this percentage (e.g. 85%)
 
 
 TRADES_LOG_FILE = os.path.join(os.path.dirname(__file__), "trades_log.jsonl")
@@ -169,6 +172,18 @@ def load_config(path: str = CONFIG_FILE_PATH) -> BotConfig:
     if "TAKE_PROFIT_MIN_GAIN_PCT" in os.environ:
         try:
             cfg.risk.take_profit_min_gain_pct = float(os.environ["TAKE_PROFIT_MIN_GAIN_PCT"])
+        except ValueError:
+            pass
+    if "AUTO_STOP_LOSS" in os.environ:
+        cfg.risk.auto_stop_loss = os.environ["AUTO_STOP_LOSS"].strip().lower() in ("true", "1", "yes")
+    if "STOP_LOSS_PRICE" in os.environ:
+        try:
+            cfg.risk.stop_loss_price = float(os.environ["STOP_LOSS_PRICE"])
+        except ValueError:
+            pass
+    if "STOP_LOSS_MAX_LOSS_PCT" in os.environ:
+        try:
+            cfg.risk.stop_loss_max_loss_pct = float(os.environ["STOP_LOSS_MAX_LOSS_PCT"])
         except ValueError:
             pass
 
