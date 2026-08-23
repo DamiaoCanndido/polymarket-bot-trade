@@ -282,6 +282,27 @@ def cmd_start(args, config: BotConfig):
         console.print("[red]Error: No active master traders configured! Run `python3 bot.py scan --save` first.[/red]")
         return
 
+    if not config.dry_run:
+        console.print("[dim]Syncing on-chain live wallet balance...[/dim]")
+        info = executor.get_wallet_balance()
+        if info.get("success"):
+            bal = float(info.get("balance_usd", 0.0))
+            config.live_initial_cash_usd = bal
+            save_config(config)
+            if "live" in tracker.portfolio:
+                tracker.portfolio["live"]["cash_usd"] = bal
+                tracker.portfolio["live"]["initial_cash_usd"] = bal
+                tracker._save_portfolio_state()
+            console.print(f"[bold green]✓ Live Wallet Balance ({info.get('address', '')[:8]}...): ${bal:,.2f} USDC (Polygon)[/bold green]")
+        else:
+            console.print(f"[yellow]Warning: Could not sync live wallet balance: {info.get('error')}[/yellow]")
+
+        console.print("[dim]Checking Polymarket CLOB API key authentication...[/dim]")
+        if executor.check_and_ensure_clob_auth():
+            console.print("[bold green]✓ Polymarket CLOB API Session: Authenticated & Active[/bold green]")
+        else:
+            console.print("[yellow]Warning: CLOB API key check returned warning; will auto-recover on order placement.[/yellow]")
+
     console.print(f"[bold green]Starting copytrading bot listening to {len(active_traders)} master traders...[/bold green]")
     console.print(f"[dim]Trade Log: {config.trades_log_file} | State: {config.portfolio_state_file}[/dim]")
     console.print(f"[dim]Polling interval: {config.poll_interval_seconds}s. Press Ctrl+C to stop.[/dim]\n")

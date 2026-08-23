@@ -27,20 +27,68 @@ class CopyExecutor:
                 text=True,
                 check=False
             )
-            if result.returncode != 0:
-                err_msg = result.stderr.strip() or f"CLI returned code {result.returncode}"
-                return {"success": False, "error": err_msg, "code": result.returncode}
+            stdout_clean = (result.stdout or "").strip()
+            stderr_clean = (result.stderr or "").strip()
 
-            try:
-                parsed = json.loads(result.stdout)
-                if isinstance(parsed, dict):
-                    parsed["success"] = True
-                    return parsed
-                return {"success": True, "data": parsed}
-            except json.JSONDecodeError:
-                return {"success": True, "raw": result.stdout.strip()}
+            parsed: Optional[Dict[str, Any]] = None
+            if stdout_clean:
+                try:
+                    loaded = json.loads(stdout_clean)
+                    if isinstance(loaded, dict):
+                        parsed = loaded
+                    elif isinstance(loaded, list):
+                        parsed = {"data": loaded}
+                except Exception:
+                    pass
+
+            if result.returncode != 0:
+                err_msg = ""
+                if parsed:
+                    err_msg = parsed.get("message") or parsed.get("error") or parsed.get("hint") or ""
+                if not err_msg:
+                    err_msg = stderr_clean or stdout_clean or f"CLI returned code {result.returncode}"
+                return {"success": False, "error": err_msg, "code": result.returncode, "parsed": parsed}
+
+            if parsed is not None:
+                if parsed.get("status") == "error":
+                    err_msg = parsed.get("message") or parsed.get("error") or "Order execution error"
+                    return {"success": False, "error": err_msg, "code": result.returncode, "parsed": parsed}
+                parsed["success"] = True
+                return parsed
+
+            return {"success": True, "raw": stdout_clean}
         except Exception as exc:
             return {"success": False, "error": str(exc), "code": -1}
+
+    def reset_clob_api_key(self) -> Dict[str, Any]:
+        """
+        Resets and re-derives Polymarket CLOB API key credentials.
+        """
+        logger.info("Refreshing/Resetting Polymarket CLOB API key...")
+        return self._run_cli(["polymarket", "clob", "reset-api-key", "--yes"])
+
+    def check_and_ensure_clob_auth(self) -> bool:
+        """
+        Tests if Polymarket CLOB API key is currently valid and active.
+        If not, automatically derives fresh credentials.
+        """
+        import time
+        res = self._run_cli(["polymarket", "clob", "balance"])
+        if res.get("success") and ("balance" in res or "allowances" in res):
+            logger.info("Polymarket CLOB API authentication is active and verified.")
+            return True
+
+        logger.warning(f"Polymarket CLOB API auth check failed ({res.get('error')}). Auto-refreshing key...")
+        self.reset_clob_api_key()
+        time.sleep(0.5)
+
+        verify_res = self._run_cli(["polymarket", "clob", "balance"])
+        if verify_res.get("success") and ("balance" in verify_res or "allowances" in verify_res):
+            logger.info("Polymarket CLOB API key successfully re-authenticated and active.")
+            return True
+
+        logger.error(f"Failed to re-authenticate Polymarket CLOB API key: {verify_res.get('error')}")
+        return False
 
     def get_portfolio_status(self) -> Dict[str, Any]:
         """
@@ -206,7 +254,19 @@ class CopyExecutor:
         if max_price is not None:
             args.extend(["--max-price", f"{max_price:.4f}"])
 
-        return self._run_cli(args)
+        res = self._run_cli(args)
+        if not res.get("success"):
+            err_str = str(res.get("error", "")).lower()
+            # Auto-recover on CLOB API key invalid/expired/unauthorized
+            if any(k in err_str for k in ("api_key", "api key", "unauthorized", "clob_auth", "401", "forbidden")):
+                logger.warning(f"Detected CLOB API key auth error ({err_str}). Auto-recovering credentials and retrying order...")
+                self.reset_clob_api_key()
+                import time
+                time.sleep(0.5)
+                # Retry once
+                res = self._run_cli(args)
+
+        return res
 
     def execute_sell(
         self,
@@ -233,4 +293,16 @@ class CopyExecutor:
         if min_price is not None:
             args.extend(["--min-price", f"{min_price:.4f}"])
 
-        return self._run_cli(args)
+        res = self._run_cli(args)
+        if not res.get("success"):
+            err_str = str(res.get("error", "")).lower()
+            # Auto-recover on CLOB API key invalid/expired/unauthorized
+            if any(k in err_str for k in ("api_key", "api key", "unauthorized", "clob_auth", "401", "forbidden")):
+                logger.warning(f"Detected CLOB API key auth error ({err_str}). Auto-recovering credentials and retrying order...")
+                self.reset_clob_api_key()
+                import time
+                time.sleep(0.5)
+                # Retry once
+                res = self._run_cli(args)
+
+        return res

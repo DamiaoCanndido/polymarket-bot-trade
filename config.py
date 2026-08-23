@@ -139,7 +139,10 @@ def load_config(path: str = CONFIG_FILE_PATH) -> BotConfig:
         cfg.bullpen_path = os.environ["BULLPEN_PATH"].strip()
     if "FIXED_AMOUNT_USD" in os.environ:
         try:
-            cfg.sizing.fixed_amount_usd = float(os.environ["FIXED_AMOUNT_USD"])
+            val = float(os.environ["FIXED_AMOUNT_USD"])
+            cfg.sizing.fixed_amount_usd = val
+            for t in cfg.traders:
+                t.copy_amount_usd = val
         except ValueError:
             pass
     if "DAILY_BUDGET_USD" in os.environ:

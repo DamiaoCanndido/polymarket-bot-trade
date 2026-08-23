@@ -1,14 +1,14 @@
 {
-  "dry_run": true,
+  "dry_run": false,
   "poll_interval_seconds": 5,
   "bullpen_path": "/home/nergal/.bullpen/bin/bullpen",
   "trades_log_file": "/home/nergal/apps/polymarket/trades_log.jsonl",
   "portfolio_state_file": "/home/nergal/apps/polymarket/portfolio_state.json",
   "paper_initial_cash_usd": 1000.0,
-  "live_initial_cash_usd": 0.0,
+  "live_initial_cash_usd": 4.12,
   "sizing": {
     "mode": "fixed",
-    "fixed_amount_usd": 10.0,
+    "fixed_amount_usd": 1.0,
     "balance_percentage": 5.0,
     "mirror_percent_cap": 10.0
   },
@@ -40,7 +40,7 @@
       "risk_tier": "moderate",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xe30e74595517de48f1fb19f4553dd3d9f1e96b87",
@@ -52,7 +52,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xa2f1fecf1cc7db65a46588f764b6691533052d22",
@@ -64,7 +64,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0x86dab59a8a6e7f9947282d2117aab3429b706428",
@@ -76,7 +76,7 @@
       "risk_tier": "moderate",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xae7ffba3fd102de1a4f795853ad3de06ad666f49",
@@ -88,7 +88,7 @@
       "risk_tier": "moderate",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0x1f7105a18d9f36aef7c83e5df210e57cf487b2e4",
@@ -100,7 +100,7 @@
       "risk_tier": "low",
       "style": "scalper",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xe1000ddb5f5025849765e29d051dfff78f5d4d41",
@@ -112,7 +112,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0x9bb1bc70c9e098f2f297416d06a0aa3992534dbe",
@@ -124,7 +124,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xf3ce7f04dde4f8c5aed19a20e5ecd8520e5ca57a",
@@ -136,7 +136,7 @@
       "risk_tier": "low",
       "style": "scalper",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0x6d57da09ef86a327524853b36fbd2e39cf0cbfc5",
@@ -148,7 +148,7 @@
       "risk_tier": "low",
       "style": "high_conviction",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xc1de5ffb02d2b354932ccf5e31172545965e21f5",
@@ -160,7 +160,7 @@
       "risk_tier": "low",
       "style": "scalper",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xc02147dee42356b7a4edbb1c35ac4ffa95f61fa8",
@@ -172,7 +172,7 @@
       "risk_tier": "moderate",
       "style": "high_conviction",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0x8546a601f7c7cc3dae7141f20b0e09e42bbf35b8",
@@ -184,7 +184,7 @@
       "risk_tier": "low",
       "style": "scalper",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xef4bce014ad8fd7e1db160693beebcbae87e2577",
@@ -196,7 +196,7 @@
       "risk_tier": "moderate",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0x8bfee7aeca33003fe9d7398d5143dc7866542d74",
@@ -208,7 +208,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0x7045a02cf571fcda1cefc08960842624fbb781b5",
@@ -220,7 +220,7 @@
       "risk_tier": "low",
       "style": "scalper",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xc72d7dcdb23597d143a83536fb97b1d7db7efc21",
@@ -232,7 +232,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0x88d17ad6bf91ca0935f6e70b37ebe3db92b618da",
@@ -244,7 +244,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0x9ee8bbc36d378af72e5f6b8e2ea2eb67c05a89de",
@@ -256,7 +256,7 @@
       "risk_tier": "moderate",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0x5d7639ed5fd3c5ebf0fc69d548e1046acd0f9168",
@@ -268,7 +268,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xfedc381bf3fb5d20433bb4a0216b15dbbc5c6398",
@@ -280,7 +280,7 @@
       "risk_tier": "low",
       "style": "high_conviction",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0x0979bad57d7a1403db89cbcd9c52bf43f2138d9b",
@@ -292,7 +292,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xf6683d202f76fc9b79e5be716ce8519dab5b5c69",
@@ -304,7 +304,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xe59f2ab1b26b403f95b9df6e18ea66b395010d08",
@@ -316,7 +316,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     },
     {
       "address": "0xe55aab114e95fff2fa267313916381d79323ecf7",
@@ -328,7 +328,7 @@
       "risk_tier": "low",
       "style": "balanced",
       "enabled": true,
-      "copy_amount_usd": 10.0
+      "copy_amount_usd": 1.0
     }
   ]
 }

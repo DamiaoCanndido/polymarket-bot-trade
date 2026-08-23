@@ -299,6 +299,18 @@ class CopyTracker:
             "portfolio_metrics": {}
         }
 
+        # Check if market slug or outcome is valid
+        if not market_slug or not market_slug.strip() or not outcome or not outcome.strip():
+            reason = "Mercado não identificado no feed do Polymarket (slug ou outcome vazio)"
+            logger.warning(f"⏭️ {reason} (Trade ID: {trade_id})")
+            mode_port["skipped_trades"] = mode_port.get("skipped_trades", 0) + 1
+            log_entry["bot_execution"]["status"] = "SKIPPED"
+            log_entry["bot_execution"]["reason"] = reason
+            log_entry["portfolio_metrics"] = self._get_portfolio_metrics(mode)
+            self._log_trade_record(log_entry)
+            self._save_portfolio_state()
+            return {"status": "SKIPPED", "reason": reason, "details": log_entry}
+
         # -------------------------------------------------------------
         # CASE 1: MASTER BOUGHT -> WE BUY
         # -------------------------------------------------------------
@@ -314,7 +326,7 @@ class CopyTracker:
             if self.config.sizing.mode == "percentage":
                 target_size_usd = master_size_usd * (self.config.sizing.mirror_percent_cap / 100.0)
             else:
-                target_size_usd = trader_info.copy_amount_usd or self.config.sizing.fixed_amount_usd
+                target_size_usd = getattr(trader_info, "copy_amount_usd", None) or self.config.sizing.fixed_amount_usd
 
             # Validate against Risk Manager for current mode
             is_valid, reason, approved_usd = self.risk_manager.validate_trade(

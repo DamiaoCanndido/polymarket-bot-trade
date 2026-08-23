@@ -43,6 +43,10 @@ class BotRunnerManager:
 
         # Initial startup log
         self.log_activity("info", "Dashboard initialized. Ready to launch copytrading bot.")
+        try:
+            threading.Thread(target=self.sync_live_wallet_balance, daemon=True).start()
+        except Exception:
+            pass
 
     def log_activity(self, level: str, message: str, details: Optional[Dict[str, Any]] = None):
         """Records an activity event into the in-memory ring buffer (capped at 100)."""
@@ -614,7 +618,10 @@ def api_config_update():
                 bot_manager.tracker.portfolio["live"]["cash_usd"] = new_live_cash
             bot_manager.tracker._save_portfolio_state()
     if "fixed_amount_usd" in data:
-        cfg.sizing.fixed_amount_usd = float(data["fixed_amount_usd"])
+        new_fixed = float(data["fixed_amount_usd"])
+        cfg.sizing.fixed_amount_usd = new_fixed
+        for t in cfg.traders:
+            t.copy_amount_usd = new_fixed
     if "daily_budget_usd" in data:
         cfg.risk.daily_budget_usd = float(data["daily_budget_usd"])
     if "max_per_market_usd" in data:
