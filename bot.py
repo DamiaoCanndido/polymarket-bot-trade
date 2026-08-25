@@ -393,6 +393,18 @@ def cmd_close_position(args, config: BotConfig):
         console.print(f"[bold red]✗ {res.get('error')}[/bold red]")
 
 
+def cmd_reset_stats(args, config: BotConfig):
+    risk_mgr = RiskManager(config.risk)
+    executor = CopyExecutor(config, risk_mgr)
+    tracker = CopyTracker(config, executor, risk_mgr)
+    target_mode = None if args.mode == "all" else args.mode
+    res = tracker.reset_statistics(mode=target_mode)
+    if res.get("success"):
+        console.print(f"[bold green]✓ {res.get('message')}[/bold green]")
+    else:
+        console.print(f"[bold red]✗ {res.get('error')}[/bold red]")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Polymarket Copytrading Bot")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
@@ -418,6 +430,10 @@ def main():
     p_close = subparsers.add_parser("close-position", help="Manually close and liquidate an open position")
     p_close.add_argument("position_key", help="Position key to close (e.g. market_slug:Outcome)")
     p_close.add_argument("--mode", default=None, choices=["paper", "live"], help="Portfolio mode (paper or live)")
+
+    # reset-stats
+    p_reset = subparsers.add_parser("reset-stats", help="Reset portfolio statistics and clear trades log")
+    p_reset.add_argument("--mode", default="all", choices=["paper", "live", "all"], help="Mode to reset (paper, live, or all)")
 
     # portfolio
     p_port = subparsers.add_parser("portfolio", help="Show current open positions and equity")
@@ -449,6 +465,8 @@ def main():
         cmd_sync_wallet(args, config)
     elif args.command == "close-position":
         cmd_close_position(args, config)
+    elif args.command == "reset-stats":
+        cmd_reset_stats(args, config)
     elif args.command == "portfolio":
         cmd_portfolio(args, config)
     elif args.command == "logs":

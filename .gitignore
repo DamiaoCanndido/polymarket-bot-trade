@@ -18,6 +18,7 @@
 *.secret
 credentials.json
 secrets.json
+config.json
 
 # Local Runtime Data, Logs & Portfolio States
 trades_log.jsonl

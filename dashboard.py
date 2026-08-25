@@ -659,6 +659,16 @@ def api_position_close():
     return jsonify(res)
 
 
+@app.route("/api/stats/reset", methods=["POST"])
+def api_stats_reset():
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode")  # "paper", "live", or None / "all"
+    res = bot_manager.tracker.reset_statistics(mode=mode)
+    mode_str = "simulação (fake)" if mode == "paper" else ("dinheiro real (live)" if mode == "live" else "todas as modalidades")
+    bot_manager.log_activity("warning", f"🧹 Estatísticas e histórico de trades resetados ({mode_str}).")
+    return jsonify(res)
+
+
 # =====================================================================
 # DASHBOARD HTML TEMPLATE
 # =====================================================================
@@ -1321,6 +1331,27 @@ DASHBOARD_HTML = """
           </div>
         </form>
       </div>
+
+      <!-- Reset Statistics Card -->
+      <div class="glass-card rounded-xl p-6 max-w-2xl border border-rose-900/50 bg-rose-950/10">
+        <h3 class="text-sm font-bold text-rose-400 mb-2 flex items-center gap-2">
+          <span>🧹</span> Limpar / Resetar Estatísticas
+        </h3>
+        <p class="text-xs text-gray-400 mb-4 leading-relaxed">
+          Zera o histórico de trades (JSONL), métricas de Win Rate, PnL e reseta o saldo de caixa para o valor inicial configurado.
+        </p>
+        <div class="flex flex-wrap items-center gap-3">
+          <button type="button" onclick="resetStatistics('paper')" class="px-3.5 py-2 bg-gray-900 hover:bg-gray-800 border border-cyan-700 text-cyan-300 font-bold rounded-lg text-xs transition flex items-center gap-1.5">
+            <span>🧪</span> Limpar Stats Simulação (Fake)
+          </button>
+          <button type="button" onclick="resetStatistics('live')" class="px-3.5 py-2 bg-gray-900 hover:bg-gray-800 border border-emerald-700 text-emerald-300 font-bold rounded-lg text-xs transition flex items-center gap-1.5">
+            <span>⚡</span> Limpar Stats Real (Live)
+          </button>
+          <button type="button" onclick="resetStatistics('all')" class="px-3.5 py-2 bg-rose-900/40 hover:bg-rose-900/70 border border-rose-600 text-rose-300 font-bold rounded-lg text-xs transition flex items-center gap-1.5">
+            <span>🗑️</span> Limpar Todas as Estatísticas
+          </button>
+        </div>
+      </div>
     </div>
 
   </main>
@@ -1675,6 +1706,30 @@ DASHBOARD_HTML = """
         saveBtn.innerHTML = '<span>Salvar Configurações</span>';
       }
       refreshAllData();
+    }
+
+    // Reset Statistics & Clear Trade History
+    async function resetStatistics(mode = 'all') {
+      const modeLabel = mode === 'paper' ? 'da Simulação (Fake)' : (mode === 'live' ? 'do Modo Real (Live)' : 'TODAS as estatísticas e histórico de trades');
+      if (!confirm(`Tem certeza que deseja zerar e limpar as estatísticas ${modeLabel}? Esta ação não pode ser desfeita.`)) {
+        return;
+      }
+      try {
+        const res = await fetch('/api/stats/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: mode === 'all' ? null : mode })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast('🧹 Estatísticas Limpas', data.message || 'Estatísticas resetadas com sucesso.', 'success');
+          refreshAllData();
+        } else {
+          showToast('Erro', data.error || 'Falha ao resetar estatísticas', 'error');
+        }
+      } catch (err) {
+        showToast('Erro', 'Falha na requisição: ' + err.message, 'error');
+      }
     }
 
     // Load initial settings from server

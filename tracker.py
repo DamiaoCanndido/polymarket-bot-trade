@@ -148,6 +148,37 @@ class CopyTracker:
         except Exception as e:
             logger.error(f"Failed to save portfolio state to {self.portfolio_state_file}: {e}")
 
+    def reset_statistics(self, mode: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Resets portfolio statistics and clears trades log.
+        If mode is 'paper', resets only paper state.
+        If mode is 'live', resets only live state.
+        If mode is None or 'all', resets both modes and clears the trades log file completely.
+        """
+        if mode == "paper":
+            self.portfolio["paper"] = self._default_mode_state(self.config.paper_initial_cash_usd)
+            self.master_positions["paper"] = {}
+        elif mode == "live":
+            self.portfolio["live"] = self._default_mode_state(self.config.live_initial_cash_usd)
+            self.master_positions["live"] = {}
+        else:
+            self.portfolio = {
+                "paper": self._default_mode_state(self.config.paper_initial_cash_usd),
+                "live": self._default_mode_state(self.config.live_initial_cash_usd),
+                "last_updated": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            }
+            self.master_positions = {"paper": {}, "live": {}}
+            self.processed_trade_ids.clear()
+            # Clear trades log file
+            try:
+                with open(self.trades_log_file, "w") as f:
+                    pass
+            except Exception as e:
+                logger.error(f"Error clearing trades log {self.trades_log_file}: {e}")
+
+        self._save_portfolio_state()
+        return {"success": True, "message": f"Estatísticas resetadas com sucesso ({mode or 'todas'})."}
+
     def _log_trade_record(self, record: Dict[str, Any]) -> None:
         """
         Appends a structured trade event to trades_log.jsonl for performance tracking and dashboard streaming.
