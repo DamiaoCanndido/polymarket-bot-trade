@@ -126,6 +126,12 @@ class BotRunnerManager:
             active_traders = [t for t in self.config.traders if t.enabled]
             mode_label = "Paper Trading (Fake)" if self.config.dry_run else "Live Execution (Real)"
 
+            if not self.config.dry_run:
+                try:
+                    self.executor.check_and_ensure_clob_auth()
+                except Exception as auth_err:
+                    logger.warning(f"CLOB auth pre-check warning: {auth_err}")
+
             self.stop_event.clear()
             self.is_running = True
             self.started_at = datetime.utcnow()

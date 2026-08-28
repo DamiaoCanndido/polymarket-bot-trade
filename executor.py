@@ -1,6 +1,9 @@
 """
 Copytrade executor module for interacting with Polymarket via Bullpen CLI.
 """
+import os
+import sys
+import time
 import json
 import subprocess
 import logging
@@ -16,15 +19,18 @@ class CopyExecutor:
         self.config = config
         self.risk_manager = risk_manager
         self.bullpen_path = config.bullpen_path
+        self._last_reset_time: float = 0.0
 
     def _run_cli(self, args: List[str]) -> Dict[str, Any]:
         cmd = [self.bullpen_path] + args + ["--output", "json"]
+        env = os.environ.copy()
         try:
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=env,
                 check=False
             )
             stdout_clean = (result.stdout or "").strip()
@@ -60,12 +66,22 @@ class CopyExecutor:
         except Exception as exc:
             return {"success": False, "error": str(exc), "code": -1}
 
-    def reset_clob_api_key(self) -> Dict[str, Any]:
+    def reset_clob_api_key(self, force: bool = False) -> Dict[str, Any]:
         """
         Resets and re-derives Polymarket CLOB API key credentials.
+        Throttled to avoid invalidating keys during concurrent batch orders.
         """
+        now = time.time()
+        if not force and (now - self._last_reset_time) < 20.0:
+            logger.info("Skipping CLOB API key reset (reset recently performed).")
+            return {"success": True, "message": "Throttled"}
+
+        self._last_reset_time = now
         logger.info("Refreshing/Resetting Polymarket CLOB API key...")
-        return self._run_cli(["polymarket", "clob", "reset-api-key", "--yes"])
+        res = self._run_cli(["polymarket", "clob", "reset-api-key", "--yes"])
+        if not res.get("success"):
+            res = self._run_cli(["polymarket", "clob", "create-api-key", "--yes"])
+        return res
 
     def check_and_ensure_clob_auth(self) -> bool:
         """
@@ -261,8 +277,7 @@ class CopyExecutor:
             if any(k in err_str for k in ("api_key", "api key", "unauthorized", "clob_auth", "401", "forbidden")):
                 logger.warning(f"Detected CLOB API key auth error ({err_str}). Auto-recovering credentials and retrying order...")
                 self.reset_clob_api_key()
-                import time
-                time.sleep(0.5)
+                time.sleep(1.0)
                 # Retry once
                 res = self._run_cli(args)
 
@@ -300,8 +315,7 @@ class CopyExecutor:
             if any(k in err_str for k in ("api_key", "api key", "unauthorized", "clob_auth", "401", "forbidden")):
                 logger.warning(f"Detected CLOB API key auth error ({err_str}). Auto-recovering credentials and retrying order...")
                 self.reset_clob_api_key()
-                import time
-                time.sleep(0.5)
+                time.sleep(1.0)
                 # Retry once
                 res = self._run_cli(args)
 

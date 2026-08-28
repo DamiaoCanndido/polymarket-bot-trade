@@ -55,8 +55,6 @@ class RiskManager:
                 remaining_budget = max(0.0, self.config.daily_budget_usd - spend)
                 if remaining_budget < self.config.min_trade_size_usd:
                     return False, f"Daily budget reached ({mode_key.upper()}: ${spend:.2f} / ${self.config.daily_budget_usd:.2f})", 0.0
-                adjusted_size = remaining_budget
-
             # Check Per-Market Exposure Cap
             current_market_exp = exposure.get(market_slug, 0.0)
             if current_market_exp + adjusted_size > self.config.max_per_market_usd:
@@ -64,6 +62,17 @@ class RiskManager:
                 if remaining_market < self.config.min_trade_size_usd:
                     return False, f"Max market exposure reached for {market_slug} ({mode_key.upper()}: ${current_market_exp:.2f} / ${self.config.max_per_market_usd:.2f})", 0.0
                 adjusted_size = remaining_market
+
+        # Check minimum shares for Polymarket CLOB compatibility (minimum 5 shares on live CLOB)
+        if side.lower() == "buy" and mode_key == "live" and price > 0:
+            est_shares = adjusted_size / price
+            if est_shares < 5.0:
+                needed_usd = round(5.0 * price, 2)
+                # Auto-adjust if within budget and maximum single trade limit
+                if needed_usd <= self.config.max_trade_size_usd and (spend + needed_usd) <= self.config.daily_budget_usd:
+                    adjusted_size = needed_usd
+                else:
+                    return False, f"Tamanho da ordem ({est_shares:.2f} cotas a ${price:.2f}) abaixo do mínimo da Polymarket (mínimo 5 cotas = ${needed_usd:.2f})", 0.0
 
         return True, "Approved", adjusted_size
 
