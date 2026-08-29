@@ -24,6 +24,9 @@ class CopyExecutor:
     def _run_cli(self, args: List[str]) -> Dict[str, Any]:
         cmd = [self.bullpen_path] + args + ["--output", "json"]
         env = os.environ.copy()
+        for p in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+            if p in env and not str(env[p]).strip():
+                env.pop(p, None)
         try:
             result = subprocess.run(
                 cmd,
@@ -69,7 +72,7 @@ class CopyExecutor:
     def reset_clob_api_key(self, force: bool = False) -> Dict[str, Any]:
         """
         Resets and re-derives Polymarket CLOB API key credentials.
-        Throttled to avoid invalidating keys during concurrent batch orders.
+        Throttled to avoid invalidating keys during concurrent batch orders unless force=True.
         """
         now = time.time()
         if not force and (now - self._last_reset_time) < 20.0:
@@ -77,10 +80,18 @@ class CopyExecutor:
             return {"success": True, "message": "Throttled"}
 
         self._last_reset_time = now
-        logger.info("Refreshing/Resetting Polymarket CLOB API key...")
-        res = self._run_cli(["polymarket", "clob", "reset-api-key", "--yes"])
+        logger.info("Refreshing/Resetting Polymarket CLOB API key via Bullpen...")
+        # Step 1: Delete stale key from CLOB server
+        self._run_cli(["polymarket", "clob", "delete-api-key", "--yes"])
+        time.sleep(0.5)
+        # Step 2: Create/derive fresh API key
+        res = self._run_cli(["polymarket", "clob", "create-api-key", "--yes"])
         if not res.get("success"):
-            res = self._run_cli(["polymarket", "clob", "create-api-key", "--yes"])
+            logger.warning(f"create-api-key fallback to reset-api-key due to: {res.get('error')}")
+            res = self._run_cli(["polymarket", "clob", "reset-api-key", "--yes"])
+        
+        # Allow Polymarket CLOB server propagation
+        time.sleep(1.5)
         return res
 
     def check_and_ensure_clob_auth(self) -> bool:
@@ -88,15 +99,13 @@ class CopyExecutor:
         Tests if Polymarket CLOB API key is currently valid and active.
         If not, automatically derives fresh credentials.
         """
-        import time
         res = self._run_cli(["polymarket", "clob", "balance"])
         if res.get("success") and ("balance" in res or "allowances" in res):
             logger.info("Polymarket CLOB API authentication is active and verified.")
             return True
 
         logger.warning(f"Polymarket CLOB API auth check failed ({res.get('error')}). Auto-refreshing key...")
-        self.reset_clob_api_key()
-        time.sleep(0.5)
+        self.reset_clob_api_key(force=True)
 
         verify_res = self._run_cli(["polymarket", "clob", "balance"])
         if verify_res.get("success") and ("balance" in verify_res or "allowances" in verify_res):
@@ -274,10 +283,10 @@ class CopyExecutor:
         if not res.get("success"):
             err_str = str(res.get("error", "")).lower()
             # Auto-recover on CLOB API key invalid/expired/unauthorized
-            if any(k in err_str for k in ("api_key", "api key", "unauthorized", "clob_auth", "401", "forbidden")):
+            if any(k in err_str for k in ("api_key", "api key", "unauthorized", "invalid api", "clob_auth", "401", "forbidden")):
                 logger.warning(f"Detected CLOB API key auth error ({err_str}). Auto-recovering credentials and retrying order...")
-                self.reset_clob_api_key()
-                time.sleep(1.0)
+                self.reset_clob_api_key(force=True)
+                time.sleep(1.5)
                 # Retry once
                 res = self._run_cli(args)
 
@@ -312,10 +321,10 @@ class CopyExecutor:
         if not res.get("success"):
             err_str = str(res.get("error", "")).lower()
             # Auto-recover on CLOB API key invalid/expired/unauthorized
-            if any(k in err_str for k in ("api_key", "api key", "unauthorized", "clob_auth", "401", "forbidden")):
+            if any(k in err_str for k in ("api_key", "api key", "unauthorized", "invalid api", "clob_auth", "401", "forbidden")):
                 logger.warning(f"Detected CLOB API key auth error ({err_str}). Auto-recovering credentials and retrying order...")
-                self.reset_clob_api_key()
-                time.sleep(1.0)
+                self.reset_clob_api_key(force=True)
+                time.sleep(1.5)
                 # Retry once
                 res = self._run_cli(args)
 

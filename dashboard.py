@@ -110,6 +110,16 @@ class BotRunnerManager:
                 }
             return {"success": False, "error": info.get("error", "Falha ao consultar carteira"), "balance_usd": 0.0}
 
+    def reset_clob_api_key(self) -> Dict[str, Any]:
+        with self.lock:
+            res = self.executor.reset_clob_api_key(force=True)
+            if res.get("success"):
+                self.log_activity("success", "🔐 Chave de API Polymarket CLOB reautenticada com sucesso via Bullpen.")
+                return {"success": True, "message": "Chave CLOB API reautenticada com sucesso."}
+            err = res.get("error", "Falha ao resetar chave CLOB")
+            self.log_activity("error", f"❌ Falha ao reautenticar chave CLOB: {err}")
+            return {"success": False, "error": err}
+
     def start(self, mode: Optional[str] = None) -> Dict[str, Any]:
         with self.lock:
             if self.is_running:
@@ -586,6 +596,12 @@ def api_wallet_sync():
     return jsonify(res)
 
 
+@app.route("/api/wallet/reauth", methods=["POST"])
+def api_wallet_reauth():
+    res = bot_manager.reset_clob_api_key()
+    return jsonify(res)
+
+
 @app.route("/api/config", methods=["GET"])
 def api_config_get():
     cfg = load_config()
@@ -864,10 +880,13 @@ DASHBOARD_HTML = """
         <div class="mt-3 pt-2.5 border-t border-gray-800 flex items-center justify-between text-xs text-gray-400 font-mono">
           <span>Trades: <strong id="mini-trades-live" class="text-white">0</strong></span>
           <span>Taxa de Acerto: <strong id="mini-wr-live" class="text-emerald-400">0.0%</strong></span>
-          <div class="flex items-center gap-2">
+          <div class="flex items-center gap-1.5">
             <span>Caixa: <strong id="mini-cash-live" class="text-gray-300">$0.00</strong></span>
             <button onclick="event.stopPropagation(); syncWalletBalance();" class="px-2 py-0.5 rounded bg-emerald-950 hover:bg-emerald-900 border border-emerald-700 text-emerald-300 font-sans text-[11px] flex items-center gap-1 font-semibold transition" title="Sincronizar saldo da carteira on-chain (Polygon)">
               <span>🔄</span> Sincronizar
+            </button>
+            <button onclick="event.stopPropagation(); reauthClobKey();" class="px-2 py-0.5 rounded bg-purple-950 hover:bg-purple-900 border border-purple-700 text-purple-300 font-sans text-[11px] flex items-center gap-1 font-semibold transition" title="Reautenticar e renovar chave de API do Polymarket CLOB via Bullpen">
+              <span>🔐</span> Chave CLOB
             </button>
           </div>
         </div>
@@ -1267,9 +1286,14 @@ DASHBOARD_HTML = """
             <div>
               <div class="flex items-center justify-between mb-1">
                 <label class="block text-gray-400">Saldo Inicial Real (USD)</label>
-                <button type="button" onclick="syncWalletBalance()" class="text-[11px] text-emerald-400 hover:text-emerald-300 flex items-center gap-1 font-semibold">
-                  <span>🔄</span> Sincronizar On-chain
-                </button>
+                <div class="flex items-center gap-2">
+                  <button type="button" onclick="syncWalletBalance()" class="text-[11px] text-emerald-400 hover:text-emerald-300 flex items-center gap-1 font-semibold" title="Sincronizar saldo on-chain">
+                    <span>🔄</span> Sincronizar
+                  </button>
+                  <button type="button" onclick="reauthClobKey()" class="text-[11px] text-purple-400 hover:text-purple-300 flex items-center gap-1 font-semibold" title="Renovar/Resetar Chave API CLOB">
+                    <span>🔐</span> Renovar Chave CLOB
+                  </button>
+                </div>
               </div>
               <input type="number" step="1" id="cfg-live-cash" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="0.0">
             </div>
@@ -1778,6 +1802,23 @@ DASHBOARD_HTML = """
         }
       } catch (err) {
         showToast('Erro', 'Falha ao sincronizar carteira: ' + err.message, 'error');
+      }
+    }
+
+    // Reautenticar e Resetar Chave API Polymarket CLOB
+    async function reauthClobKey() {
+      showToast('Autenticação CLOB', 'Reautenticando e gerando nova chave de API do Polymarket...', 'info');
+      try {
+        const res = await fetch('/api/wallet/reauth', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          showToast('CLOB Reautenticado', 'Chave de API do Polymarket CLOB ativa e renovada com sucesso!', 'success');
+          syncWalletBalance();
+        } else {
+          showToast('Erro de Autenticação', data.error || 'Falha ao renovar chave CLOB', 'error');
+        }
+      } catch (err) {
+        showToast('Erro', 'Falha ao reautenticar chave CLOB: ' + err.message, 'error');
       }
     }
 

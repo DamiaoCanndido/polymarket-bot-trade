@@ -108,11 +108,17 @@ def load_dotenv(env_path: Optional[str] = None) -> None:
                     key = key.strip()
                     val = val.strip().strip("'\"")
                     if key:
-                        os.environ[key] = val
-                        # Automatically mirror proxy variables to lowercase for cross-tool compatibility
-                        if key.upper() in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
-                            os.environ[key.lower()] = val
-                            os.environ[key.upper()] = val
+                        if val:
+                            os.environ[key] = val
+                            # Automatically mirror proxy variables to lowercase for cross-tool compatibility
+                            if key.upper() in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+                                os.environ[key.lower()] = val
+                                os.environ[key.upper()] = val
+                        else:
+                            os.environ.pop(key, None)
+                            if key.upper() in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+                                os.environ.pop(key.lower(), None)
+                                os.environ.pop(key.upper(), None)
     except Exception:
         pass
 
