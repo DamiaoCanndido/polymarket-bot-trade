@@ -9,6 +9,8 @@ import time
 import uuid
 import logging
 import threading
+import urllib.request
+import urllib.error
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from flask import Flask, jsonify, request, render_template_string
@@ -88,37 +90,113 @@ class BotRunnerManager:
     def get_wallet_info(self) -> Dict[str, Any]:
         return self.executor.get_wallet_balance()
 
-    def sync_live_wallet_balance(self) -> Dict[str, Any]:
+    def sync_live_wallet_balance(self, address: Optional[str] = None) -> Dict[str, Any]:
         with self.lock:
-            info = self.executor.get_wallet_balance()
-            if info.get("success"):
-                bal = float(info.get("balance_usd", 0.0))
-                wallet_addr = info.get("address", "")
-                self.config.live_initial_cash_usd = bal
+            if address is not None:
+                clean_addr = address.strip()
+                if clean_addr.startswith("0x00000000000000"):
+                    clean_addr = ""
+                self.config.user_wallet_address = clean_addr
                 save_config(self.config)
-                if "live" in self.tracker.portfolio:
-                    self.tracker.portfolio["live"]["cash_usd"] = bal
-                    self.tracker.portfolio["live"]["initial_cash_usd"] = bal
-                    self.tracker._save_portfolio_state()
-                display_addr = f"{wallet_addr[:6]}...{wallet_addr[-4:]}" if len(wallet_addr) >= 10 else wallet_addr
-                self.log_activity("success", f"💰 Saldo da carteira real ({display_addr}) sincronizado: ${bal:,.2f}")
+
+            addr = self.config.user_wallet_address.strip()
+            if not addr or addr.startswith("0x00000000000000"):
                 return {
                     "success": True,
-                    "balance_usd": bal,
-                    "address": wallet_addr,
-                    "message": f"Saldo sincronizado com sucesso: ${bal:,.2f}"
+                    "address": "Modo Manual (Navegador)",
+                    "balance_usd": self.config.live_initial_cash_usd,
+                    "message": "Nenhum endereço público configurado. Saldo e posições reais são atualizados conforme seus registros manuais."
                 }
-            return {"success": False, "error": info.get("error", "Falha ao consultar carteira"), "balance_usd": 0.0}
 
-    def reset_clob_api_key(self) -> Dict[str, Any]:
-        with self.lock:
-            res = self.executor.reset_clob_api_key(force=True)
-            if res.get("success"):
-                self.log_activity("success", "🔐 Chave de API Polymarket CLOB reautenticada com sucesso via Bullpen.")
-                return {"success": True, "message": "Chave CLOB API reautenticada com sucesso."}
-            err = res.get("error", "Falha ao resetar chave CLOB")
-            self.log_activity("error", f"❌ Falha ao reautenticar chave CLOB: {err}")
-            return {"success": False, "error": err}
+            try:
+                # 1. Query on-chain USDC.e / Native USDC balance on Polygon
+                onchain_usdc = None
+                for token_contract in ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"):
+                    try:
+                        data_payload = "0x70a08231000000000000000000000000" + addr[2:].lower()
+                        rpc_payload = json.dumps({
+                            "jsonrpc": "2.0",
+                            "method": "eth_call",
+                            "params": [{"to": token_contract, "data": data_payload}, "latest"],
+                            "id": 1
+                        }).encode("utf-8")
+                        rpc_req = urllib.request.Request(
+                            "https://polygon-bor-rpc.publicnode.com",
+                            data=rpc_payload,
+                            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+                        )
+                        with urllib.request.urlopen(rpc_req, timeout=4) as rpc_resp:
+                            rpc_res = json.loads(rpc_resp.read().decode())
+                            hex_val = rpc_res.get("result", "0x0")
+                            raw_bal = int(hex_val, 16)
+                            bal_found = round(raw_bal / 1e6, 2)
+                            if bal_found > 0 or onchain_usdc is None:
+                                onchain_usdc = bal_found
+                    except Exception:
+                        pass
+
+                # 2. Query open positions on Polymarket
+                url = f"https://data-api.polymarket.com/positions?user={addr}"
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    pos_data = json.loads(resp.read().decode())
+                    if isinstance(pos_data, list):
+                        live_pos = {}
+                        total_pos_val = 0.0
+                        for p in pos_data:
+                            title = p.get("title") or p.get("marketSlug") or "Posição"
+                            slug = p.get("slug") or p.get("marketSlug") or ""
+                            event_slug = p.get("eventSlug") or slug
+                            outcome = p.get("outcome") or "Yes"
+                            size = float(p.get("size") or 0.0)
+                            cur_price = float(p.get("curPrice") or p.get("avgPrice") or 0.5)
+                            total_cost = float(p.get("initialValue") or (size * float(p.get("avgPrice") or 0.5)))
+                            val = size * cur_price
+                            total_pos_val += val
+                            k = f"{slug}:{outcome}" if slug else f"pos_{p.get('asset', '')}"
+                            live_pos[k] = {
+                                "market_slug": slug,
+                                "event_slug": event_slug,
+                                "market_title": title,
+                                "market_url": f"https://polymarket.com/event/{event_slug}" if event_slug else "",
+                                "outcome": outcome,
+                                "shares": round(size, 2),
+                                "total_cost": round(total_cost, 2),
+                                "avg_price": round(float(p.get("avgPrice") or 0.5), 3),
+                                "last_price": round(cur_price, 3)
+                            }
+
+                        if "live" in self.tracker.portfolio:
+                            if onchain_usdc is not None and onchain_usdc > 0:
+                                self.tracker.portfolio["live"]["cash_usd"] = onchain_usdc
+                                self.tracker.portfolio["live"]["initial_cash_usd"] = onchain_usdc
+                                self.config.live_initial_cash_usd = onchain_usdc
+                                save_config(self.config)
+
+                            self.tracker.portfolio["live"]["positions"] = live_pos
+                            self.tracker.portfolio["live"]["positions_value_usd"] = round(total_pos_val, 2)
+                            self.tracker.portfolio["live"]["total_equity_usd"] = round(
+                                self.tracker.portfolio["live"]["cash_usd"] + total_pos_val, 2
+                            )
+                            self.tracker.portfolio["live"]["open_positions_count"] = len(live_pos)
+                            self.tracker._save_portfolio_state()
+
+                        display_addr = f"{addr[:6]}...{addr[-4:]}" if len(addr) >= 10 else addr
+                        cash_current = self.tracker.portfolio["live"]["cash_usd"]
+                        self.log_activity("success", f"💰 Carteira Polymarket ({display_addr}) sincronizada: Caixa ${cash_current:,.2f} | {len(live_pos)} posições (${total_pos_val:,.2f})")
+                        return {
+                            "success": True,
+                            "balance_usd": cash_current,
+                            "positions_value_usd": round(total_pos_val, 2),
+                            "open_positions_count": len(live_pos),
+                            "address": addr,
+                            "message": f"Carteira ({display_addr}) sincronizada: Caixa ${cash_current:,.2f}, {len(live_pos)} posições ativas."
+                        }
+            except Exception as e:
+                logger.error(f"Erro ao consultar carteira pública Polymarket: {e}")
+                return {"success": False, "error": f"Falha ao consultar API Polymarket: {e}", "balance_usd": 0.0}
+
+            return {"success": True, "balance_usd": self.config.live_initial_cash_usd, "address": addr}
 
     def start(self, mode: Optional[str] = None) -> Dict[str, Any]:
         with self.lock:
@@ -592,13 +670,9 @@ def api_wallet_info():
 
 @app.route("/api/wallet/sync", methods=["POST"])
 def api_wallet_sync():
-    res = bot_manager.sync_live_wallet_balance()
-    return jsonify(res)
-
-
-@app.route("/api/wallet/reauth", methods=["POST"])
-def api_wallet_reauth():
-    res = bot_manager.reset_clob_api_key()
+    data = request.get_json(silent=True) or {}
+    addr = data.get("address")
+    res = bot_manager.sync_live_wallet_balance(address=addr)
     return jsonify(res)
 
 
@@ -607,6 +681,7 @@ def api_config_get():
     cfg = load_config()
     return jsonify({
         "dry_run": cfg.dry_run,
+        "user_wallet_address": getattr(cfg, "user_wallet_address", ""),
         "fixed_amount_usd": cfg.sizing.fixed_amount_usd,
         "daily_budget_usd": cfg.risk.daily_budget_usd,
         "max_per_market_usd": cfg.risk.max_per_market_usd,
@@ -627,6 +702,11 @@ def api_config_update():
     data = request.get_json(silent=True) or {}
     cfg = load_config()
     
+    if "user_wallet_address" in data:
+        addr = str(data["user_wallet_address"]).strip()
+        if addr.startswith("0x00000000000000"):
+            addr = ""
+        cfg.user_wallet_address = addr
     if "dry_run" in data:
         cfg.dry_run = bool(data["dry_run"])
     if "paper_initial_cash_usd" in data:
@@ -665,7 +745,7 @@ def api_config_update():
 
     save_config(cfg)
     bot_manager.reload_config()
-    bot_manager.log_activity("info", "⚙️ Configurações de risco (Take-Profit & Stop-Loss) atualizadas.")
+    bot_manager.log_activity("info", "⚙️ Configurações de carteira e risco atualizadas.")
     return jsonify({"success": True, "message": "Configurações salvas com sucesso."})
 
 
@@ -687,7 +767,71 @@ def api_stats_reset():
     mode = data.get("mode")  # "paper", "live", or None / "all"
     res = bot_manager.tracker.reset_statistics(mode=mode)
     mode_str = "simulação (fake)" if mode == "paper" else ("dinheiro real (live)" if mode == "live" else "todas as modalidades")
-    bot_manager.log_activity("warning", f"🧹 Estatísticas e histórico de trades resetados ({mode_str}).")
+    bot_manager.log_activity("info", f"🧹 Estatísticas resetadas: {mode_str}.")
+    return jsonify(res)
+
+
+@app.route("/api/sports/signals", methods=["GET"])
+def api_sports_signals():
+    opps = []
+    if hasattr(bot_manager.tracker, "sports_scanner"):
+        try:
+            opps = bot_manager.tracker.sports_scanner.scan_sports_opportunities()
+        except Exception as e:
+            logger.error(f"Error scanning sports: {e}")
+
+    signals_log = []
+    signals_file = getattr(bot_manager.config, "signals_log_file", "")
+    if signals_file and os.path.exists(signals_file):
+        try:
+            with open(signals_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            signals_log.append(json.loads(line.strip()))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    return jsonify({
+        "success": True,
+        "live_opportunities": opps[:40],
+        "recent_signals": list(reversed(signals_log[-50:]))
+    })
+
+
+@app.route("/api/sports/manual-trade", methods=["POST"])
+def api_sports_manual_trade():
+    data = request.get_json(silent=True) or {}
+    market_slug = data.get("market_slug", "")
+    outcome = data.get("outcome", "Yes")
+    mode = data.get("mode", "live")
+    try:
+        price = float(data.get("price", 0.50))
+    except (ValueError, TypeError):
+        price = 0.50
+    try:
+        amount_usd = float(data.get("amount_usd", 5.0))
+    except (ValueError, TypeError):
+        amount_usd = 5.0
+    market_title = data.get("market_title", market_slug)
+    event_url = data.get("event_url", "")
+
+    if not market_slug:
+        return jsonify({"success": False, "error": "market_slug é obrigatório."}), 400
+
+    res = bot_manager.tracker.record_manual_trade(
+        market_slug=market_slug,
+        outcome=outcome,
+        price=price,
+        amount_usd=amount_usd,
+        market_title=market_title,
+        event_url=event_url,
+        mode=mode
+    )
+    mode_desc = "real" if mode == "live" else "simulada (fake)"
+    bot_manager.log_activity("success", f"💰 Aposta {mode_desc} manual registrada: ${amount_usd:.2f} em {outcome} ({market_slug})")
     return jsonify(res)
 
 
@@ -869,7 +1013,7 @@ DASHBOARD_HTML = """
                 <h3 class="text-sm font-bold text-white">Dinheiro Real (Live Trading)</h3>
                 <span id="pill-active-live" class="hidden px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500 text-gray-950">ATIVO NA TELA</span>
               </div>
-              <p class="text-xs text-gray-400">Carteira: <span class="font-mono text-emerald-400" title="0xcc78a24c4856c0f195ad26354d549255b5f2ab18">0xcc78...ab18</span> (Polygon)</p>
+              <p class="text-xs text-gray-400">Carteira: <span id="header-wallet-address" class="font-mono text-emerald-400">Manual (Navegador)</span></p>
             </div>
           </div>
           <div class="text-right">
@@ -882,11 +1026,8 @@ DASHBOARD_HTML = """
           <span>Taxa de Acerto: <strong id="mini-wr-live" class="text-emerald-400">0.0%</strong></span>
           <div class="flex items-center gap-1.5">
             <span>Caixa: <strong id="mini-cash-live" class="text-gray-300">$0.00</strong></span>
-            <button onclick="event.stopPropagation(); syncWalletBalance();" class="px-2 py-0.5 rounded bg-emerald-950 hover:bg-emerald-900 border border-emerald-700 text-emerald-300 font-sans text-[11px] flex items-center gap-1 font-semibold transition" title="Sincronizar saldo da carteira on-chain (Polygon)">
+            <button onclick="event.stopPropagation(); syncWalletBalance();" class="px-2 py-0.5 rounded bg-emerald-950 hover:bg-emerald-900 border border-emerald-700 text-emerald-300 font-sans text-[11px] flex items-center gap-1 font-semibold transition" title="Sincronizar posições diretamente da sua conta pública Polymarket">
               <span>🔄</span> Sincronizar
-            </button>
-            <button onclick="event.stopPropagation(); reauthClobKey();" class="px-2 py-0.5 rounded bg-purple-950 hover:bg-purple-900 border border-purple-700 text-purple-300 font-sans text-[11px] flex items-center gap-1 font-semibold transition" title="Reautenticar e renovar chave de API do Polymarket CLOB via Bullpen">
-              <span>🔐</span> Chave CLOB
             </button>
           </div>
         </div>
@@ -1102,23 +1243,111 @@ DASHBOARD_HTML = """
     </div>
 
     <!-- TABS NAVIGATION -->
-    <div class="border-b border-bordercol flex space-x-8 text-sm">
-      <button onclick="switchTab('trades')" id="tab-btn-trades" class="pb-3 tab-active flex items-center gap-2">
+    <div class="border-b border-bordercol flex space-x-6 text-sm overflow-x-auto">
+      <button onclick="switchTab('sports')" id="tab-btn-sports" class="pb-3 tab-active flex items-center gap-2 font-bold text-emerald-400">
+        <span>⚡</span> Sinais Esportivos AO VIVO (<span id="tab-sports-count">0</span>)
+      </button>
+      <button onclick="switchTab('trades')" id="tab-btn-trades" class="pb-3 text-gray-400 hover:text-gray-200 flex items-center gap-2">
         <span>📋</span> Feed de Operações (<span id="tab-trades-count">0</span>)
       </button>
       <button onclick="switchTab('positions')" id="tab-btn-positions" class="pb-3 text-gray-400 hover:text-gray-200 flex items-center gap-2">
         <span>📊</span> Posições Abertas (<span id="tab-pos-count">0</span>)
       </button>
       <button onclick="switchTab('traders')" id="tab-btn-traders" class="pb-3 text-gray-400 hover:text-gray-200 flex items-center gap-2">
-        <span>👥</span> Top 25 Master Traders (<span id="tab-traders-count">25</span>)
+        <span>👥</span> Top Master Traders (<span id="tab-traders-count">25</span>)
       </button>
       <button onclick="switchTab('settings')" id="tab-btn-settings" class="pb-3 text-gray-400 hover:text-gray-200 flex items-center gap-2">
-        <span>⚙️</span> Configurações & Gestão de Risco
+        <span>⚙️</span> Configurações & Risco
       </button>
     </div>
 
+    <!-- TAB 0: LIVE SPORTS SIGNALS (PRIMARY) -->
+    <div id="tab-content-sports" class="space-y-4">
+      <div class="flex flex-col sm:flex-row items-center justify-between gap-3 bg-gray-900/60 p-4 rounded-xl border border-bordercol">
+        <div class="flex items-center space-x-3">
+          <div class="p-2 rounded-lg bg-emerald-950 text-emerald-400 border border-emerald-800 text-lg">
+            ⚽
+          </div>
+          <div>
+            <h3 class="text-sm font-bold text-white flex items-center gap-2">
+              Sinais de Mercados Esportivos em Tempo Real
+              <span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500 text-gray-950 animate-pulse">AO VIVO</span>
+            </h3>
+            <p class="text-xs text-gray-400 mt-0.5">
+              Identifica odds de valor em futebol, basquete, tênis e MMA. Clique em <strong>"Apostar na Polymarket ↗"</strong> para abrir o mercado sem bloqueio da Cloudflare.
+            </p>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <!-- Audio toggle button -->
+          <button id="btn-sound-toggle" onclick="toggleSoundAlert()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-gray-800 hover:bg-gray-700 text-emerald-400 border border-gray-700 flex items-center gap-1.5 transition">
+            <span id="sound-icon">🔊</span>
+            <span id="sound-label">Som: Ativado</span>
+          </button>
+          <!-- Refresh button -->
+          <button onclick="loadSportsSignals(true)" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1.5 shadow-lg shadow-emerald-950/40 transition">
+            <span>🔄</span> Atualizar Sinais
+          </button>
+        </div>
+      </div>
+
+      <!-- Sports Category Filters & Search -->
+      <div class="flex flex-col sm:flex-row items-center justify-between gap-3">
+        <div class="flex items-center space-x-2 overflow-x-auto max-w-full pb-1 sm:pb-0">
+          <button onclick="filterSportsCategory('ALL')" class="sports-cat-btn px-3 py-1 rounded-md text-xs font-semibold bg-emerald-600 text-white" data-cat="ALL">Todos os Esportes</button>
+          <button onclick="filterSportsCategory('Soccer')" class="sports-cat-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-cat="Soccer">⚽ Futebol</button>
+          <button onclick="filterSportsCategory('Basketball')" class="sports-cat-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-cat="Basketball">🏀 Basquete / NBA</button>
+          <button onclick="filterSportsCategory('Tennis')" class="sports-cat-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-cat="Tennis">🎾 Tênis</button>
+          <button onclick="filterSportsCategory('MMA')" class="sports-cat-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-cat="MMA">🥊 MMA / UFC</button>
+          <button onclick="filterSportsCategory('Esports')" class="sports-cat-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white" data-cat="Esports">🎮 Esports</button>
+        </div>
+        <div class="relative w-full sm:w-64">
+          <input type="text" id="sports-search" oninput="renderSportsCards()" placeholder="Buscar time, lutador ou torneio..." class="w-full bg-gray-900 border border-gray-800 rounded-lg px-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500">
+        </div>
+      </div>
+
+      <!-- Sports Live Cards Grid -->
+      <div id="sports-cards-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div class="col-span-full py-12 text-center text-gray-500 glass-card rounded-xl">
+          <span class="text-2xl mb-2 block">⚽</span>
+          Escaneando eventos esportivos na Polymarket...
+        </div>
+      </div>
+
+      <!-- Recent Signals History Table -->
+      <div class="glass-card rounded-xl overflow-hidden border border-bordercol mt-6">
+        <div class="bg-gray-900/90 px-4 py-3 border-b border-bordercol flex items-center justify-between">
+          <h4 class="text-xs font-bold text-gray-300 uppercase tracking-wider flex items-center gap-2">
+            <span>📜</span> Histórico de Sinais Disparados Recentemente
+          </h4>
+          <span class="text-[11px] text-gray-500">Registrado em signals_log.jsonl</span>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-xs">
+            <thead class="bg-gray-900/60 text-gray-400 border-b border-bordercol uppercase tracking-wider font-semibold">
+              <tr>
+                <th class="px-4 py-2.5">Horário</th>
+                <th class="px-4 py-2.5">Modalidade</th>
+                <th class="px-4 py-2.5">Evento / Partida</th>
+                <th class="px-4 py-2.5">Seleção Sugerida</th>
+                <th class="px-4 py-2.5 text-right">Odd / Preço</th>
+                <th class="px-4 py-2.5 text-right">Valor Sugerido</th>
+                <th class="px-4 py-2.5 text-center">Ações</th>
+              </tr>
+            </thead>
+            <tbody id="sports-history-tbody" class="divide-y divide-gray-800">
+              <tr>
+                <td colspan="7" class="px-4 py-6 text-center text-gray-500">Nenhum sinal recente registrado ainda.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
     <!-- TAB 1: TRADES FEED -->
-    <div id="tab-content-trades" class="space-y-4">
+    <div id="tab-content-trades" class="hidden space-y-4">
       <div class="flex flex-col sm:flex-row items-center justify-between gap-3">
         <div class="flex items-center space-x-2 overflow-x-auto max-w-full pb-1 sm:pb-0">
           <button onclick="filterTrades('ALL')" class="trade-filter-btn px-3 py-1 rounded-md text-xs font-semibold bg-cyan-600 text-white" data-filter="ALL">Todos</button>
@@ -1286,17 +1515,25 @@ DASHBOARD_HTML = """
             <div>
               <div class="flex items-center justify-between mb-1">
                 <label class="block text-gray-400">Saldo Inicial Real (USD)</label>
-                <div class="flex items-center gap-2">
-                  <button type="button" onclick="syncWalletBalance()" class="text-[11px] text-emerald-400 hover:text-emerald-300 flex items-center gap-1 font-semibold" title="Sincronizar saldo on-chain">
-                    <span>🔄</span> Sincronizar
-                  </button>
-                  <button type="button" onclick="reauthClobKey()" class="text-[11px] text-purple-400 hover:text-purple-300 flex items-center gap-1 font-semibold" title="Renovar/Resetar Chave API CLOB">
-                    <span>🔐</span> Renovar Chave CLOB
-                  </button>
-                </div>
               </div>
               <input type="number" step="1" id="cfg-live-cash" class="w-full bg-gray-900 border border-gray-800 rounded-lg p-2 text-white" value="0.0">
             </div>
+          </div>
+
+          <!-- Polymarket Public Wallet Address (Optional) -->
+          <div class="p-3.5 bg-gray-900/60 border border-gray-800 rounded-lg space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="font-bold text-white flex items-center gap-1.5 text-xs">
+                <span>🌐</span> Endereço da sua Carteira Polymarket (Modo Leitura)
+              </label>
+              <button type="button" onclick="syncWalletBalance()" class="text-[11px] text-emerald-400 hover:text-emerald-300 flex items-center gap-1 font-semibold" title="Sincronizar posições diretamente da Polymarket">
+                <span>🔄</span> Sincronizar Posições
+              </button>
+            </div>
+            <input type="text" id="cfg-wallet-address" placeholder="0x... (seu endereço proxy público no polymarket.com)" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2 text-white font-mono text-xs">
+            <p class="text-[11px] text-gray-400">
+              Opcional. Se informado, o bot consulta suas posições abertas reais diretamente da <strong>API pública da Polymarket</strong> sem necessidade de senhas ou chaves privadas.
+            </p>
           </div>
 
           <!-- Auto Take-Profit Card -->
@@ -1512,14 +1749,297 @@ DASHBOARD_HTML = """
       }
     }
 
+    let liveSportsSignals = [];
+    let recentSignalsLog = [];
+    let sportsCategoryFilter = 'ALL';
+    let soundAlertEnabled = true;
+    let knownSignalIds = new Set();
+
+    function playSignalChime() {
+      if (!soundAlertEnabled) return;
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(523.25, ctx.currentTime); // C5
+        osc.frequency.setValueAtTime(659.25, ctx.currentTime + 0.1); // E5
+        osc.frequency.setValueAtTime(783.99, ctx.currentTime + 0.2); // G5
+        gain.gain.setValueAtTime(0.2, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.5);
+      } catch (e) {}
+    }
+
+    function toggleSoundAlert() {
+      soundAlertEnabled = !soundAlertEnabled;
+      const icon = document.getElementById('sound-icon');
+      const label = document.getElementById('sound-label');
+      const btn = document.getElementById('btn-sound-toggle');
+      if (soundAlertEnabled) {
+        if (icon) icon.innerText = '🔊';
+        if (label) label.innerText = 'Som: Ativado';
+        if (btn) btn.className = 'px-3 py-1.5 rounded-lg text-xs font-semibold bg-gray-800 hover:bg-gray-700 text-emerald-400 border border-gray-700 flex items-center gap-1.5 transition';
+        playSignalChime();
+      } else {
+        if (icon) icon.innerText = '🔇';
+        if (label) label.innerText = 'Som: Desativado';
+        if (btn) btn.className = 'px-3 py-1.5 rounded-lg text-xs font-semibold bg-gray-900 text-gray-500 border border-gray-800 flex items-center gap-1.5 transition';
+      }
+    }
+
+    function filterSportsCategory(cat) {
+      sportsCategoryFilter = cat;
+      document.querySelectorAll('.sports-cat-btn').forEach(btn => {
+        if (btn.getAttribute('data-cat') === cat) {
+          btn.className = 'sports-cat-btn px-3 py-1 rounded-md text-xs font-semibold bg-emerald-600 text-white';
+        } else {
+          btn.className = 'sports-cat-btn px-3 py-1 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-white';
+        }
+      });
+      renderSportsCards();
+    }
+
+    async function loadSportsSignals(isManual = false) {
+      try {
+        const res = await fetch('/api/sports/signals');
+        const data = await res.json();
+        if (data.success) {
+          liveSportsSignals = data.live_opportunities || [];
+          recentSignalsLog = data.recent_signals || [];
+
+          // Update count badge
+          const countEl = document.getElementById('tab-sports-count');
+          if (countEl) countEl.innerText = liveSportsSignals.length;
+
+          // Check if brand new signals arrived to play chime
+          let hasNew = false;
+          liveSportsSignals.forEach(s => {
+            if (!knownSignalIds.has(s.id)) {
+              knownSignalIds.add(s.id);
+              hasNew = true;
+            }
+          });
+          if (hasNew && !isManual) {
+            playSignalChime();
+          }
+
+          renderSportsCards();
+          renderSportsHistory();
+
+          if (isManual) {
+            showToast('Sinais Atualizados', `${liveSportsSignals.length} oportunidades esportivas escaneadas na Polymarket.`, 'success');
+          }
+        }
+      } catch (e) {
+        console.error('Error loading sports signals:', e);
+      }
+    }
+
+    function renderSportsCards() {
+      const grid = document.getElementById('sports-cards-grid');
+      if (!grid) return;
+
+      const searchVal = (document.getElementById('sports-search') ? document.getElementById('sports-search').value : '').toLowerCase().trim();
+
+      let filtered = liveSportsSignals.filter(s => {
+        if (sportsCategoryFilter !== 'ALL' && s.sport_category !== sportsCategoryFilter) {
+          return false;
+        }
+        if (searchVal) {
+          const matchTitle = (s.event_title || '').toLowerCase().includes(searchVal);
+          const matchMarket = (s.market_question || '').toLowerCase().includes(searchVal);
+          const matchOutcome = (s.outcome || '').toLowerCase().includes(searchVal);
+          if (!matchTitle && !matchMarket && !matchOutcome) return false;
+        }
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        grid.innerHTML = `
+          <div class="col-span-full py-12 text-center text-gray-500 glass-card rounded-xl">
+            <span class="text-3xl mb-2 block">🔍</span>
+            Nenhuma oportunidade esportiva encontrada com os filtros selecionados.
+          </div>
+        `;
+        return;
+      }
+
+      grid.innerHTML = filtered.map(s => {
+        const pUrl = s.event_url || `https://polymarket.com/event/${s.event_slug}`;
+        const price = s.price || 0.50;
+        const oddsPct = s.odds_pct || `${(price * 100).toFixed(1)}%`;
+        const volStr = '$' + (s.volume_24h_usd || 0).toLocaleString('en-US', {maximumFractionDigits: 0});
+        const liqStr = '$' + (s.liquidity_usd || 0).toLocaleString('en-US', {maximumFractionDigits: 0});
+        const confBadge = s.confidence === 'Alta'
+          ? '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-950 text-emerald-300 border border-emerald-700">Alta Confiança</span>'
+          : '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-cyan-950 text-cyan-300 border border-cyan-700">Valor Estratégico</span>';
+
+        return `
+          <div class="glass-card rounded-xl p-4 border border-gray-800 hover:border-emerald-500/50 transition-all duration-200 flex flex-col justify-between space-y-3.5 bg-gray-950/60 shadow-lg shadow-black/40 group">
+            <div>
+              <div class="flex items-center justify-between gap-2 pb-2 border-b border-gray-800/80">
+                <span class="text-xs font-bold text-cyan-400 flex items-center gap-1.5">
+                  ${s.sport_label || '🏆 Esportes'}
+                </span>
+                ${confBadge}
+              </div>
+
+              <h4 class="text-sm font-bold text-white mt-2.5 leading-snug line-clamp-2 group-hover:text-emerald-300 transition" title="${s.event_title}">
+                ${s.event_title}
+              </h4>
+              ${s.market_question && s.market_question !== s.event_title ? `<p class="text-[11px] text-gray-400 mt-1 line-clamp-1">${s.market_question}</p>` : ''}
+            </div>
+
+            <div class="bg-gray-900/90 rounded-lg p-3 border border-gray-800 flex items-center justify-between">
+              <div>
+                <span class="text-[10px] uppercase tracking-wider text-gray-400 font-semibold block">Aposta Sugerida</span>
+                <span class="text-sm font-black text-yellow-400">${s.outcome}</span>
+              </div>
+              <div class="text-right">
+                <span class="text-[10px] uppercase tracking-wider text-gray-400 font-semibold block">Preço / Odd</span>
+                <span class="text-base font-black text-emerald-400 font-mono">$${price.toFixed(3)} <span class="text-xs text-gray-400 font-normal">(${oddsPct})</span></span>
+              </div>
+            </div>
+
+            <div class="flex items-center justify-between text-[11px] text-gray-400 font-mono px-1">
+              <span>Vol 24h: <strong class="text-gray-200">${volStr}</strong></span>
+              <span>Liquidez: <strong class="text-gray-200">${liqStr}</strong></span>
+            </div>
+
+            <div class="pt-1 space-y-2">
+              <a href="${pUrl}" target="_blank" rel="noopener noreferrer" class="w-full py-2 px-3 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white flex items-center justify-center gap-1.5 shadow-md shadow-emerald-950/50 transition duration-150 transform active:scale-95" title="Abrir e comprar diretamente no site oficial da Polymarket">
+                <span>🔗 Apostar na Polymarket ↗</span>
+              </a>
+
+              <div class="grid grid-cols-2 gap-2 text-[11px]">
+                <button onclick="recordManualTradeModal('${s.market_slug || s.event_slug}', '${s.outcome}', ${price}, '${(s.event_title || '').replace(/'/g, "\\'")}', '${pUrl}')" class="py-1.5 px-2 rounded-lg bg-gray-900 hover:bg-gray-800 border border-emerald-700/80 text-emerald-300 font-bold transition flex items-center justify-center gap-1" title="Registra no seu portfólio real que você fez esta aposta">
+                  <span>✅ Já Apostei</span>
+                </button>
+                <button onclick="simulatePaperTrade('${s.market_slug || s.event_slug}', '${s.outcome}', ${price}, '${(s.event_title || '').replace(/'/g, "\\'")}', '${pUrl}')" class="py-1.5 px-2 rounded-lg bg-gray-900 hover:bg-gray-800 border border-cyan-700/80 text-cyan-300 font-bold transition flex items-center justify-center gap-1" title="Simula a entrada no dinheiro fake para testar">
+                  <span>🧪 Simular Fake</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderSportsHistory() {
+      const tbody = document.getElementById('sports-history-tbody');
+      if (!tbody) return;
+
+      if (!recentSignalsLog || recentSignalsLog.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="7" class="px-4 py-6 text-center text-gray-500">Nenhum sinal recente registrado ainda.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = recentSignalsLog.map(s => {
+        const timeStr = s.timestamp ? s.timestamp.replace('T', ' ').replace('Z', '') : '-';
+        const title = s.event_title || s.market_title || s.market_slug || '-';
+        const outcome = s.outcome || 'Yes';
+        const price = s.price ? `$${Number(s.price).toFixed(3)}` : '-';
+        const amt = s.suggested_amount_usd ? `$${Number(s.suggested_amount_usd).toFixed(2)}` : '$5.00';
+        const targetSlug = s.event_slug || s.market_slug || '';
+        const url = s.event_url || (targetSlug ? `https://polymarket.com/event/${targetSlug}` : '');
+
+        return `
+          <tr class="hover:bg-gray-900/50 transition">
+            <td class="px-4 py-2.5 text-gray-400 font-mono text-[11px] whitespace-nowrap">${timeStr}</td>
+            <td class="px-4 py-2.5 font-semibold text-cyan-400 whitespace-nowrap">${s.sport_label || '🏆 Esportes'}</td>
+            <td class="px-4 py-2.5 font-medium text-white max-w-[280px] truncate" title="${title}">${title}</td>
+            <td class="px-4 py-2.5 font-bold text-yellow-400 whitespace-nowrap">${outcome}</td>
+            <td class="px-4 py-2.5 text-right font-mono text-emerald-400 font-bold whitespace-nowrap">${price}</td>
+            <td class="px-4 py-2.5 text-right font-mono text-gray-300 font-bold whitespace-nowrap">${amt}</td>
+            <td class="px-4 py-2.5 text-center whitespace-nowrap">
+              ${url ? `
+                <a href="${url}" target="_blank" rel="noopener noreferrer" class="px-2 py-1 rounded bg-emerald-950 text-emerald-300 border border-emerald-800 hover:bg-emerald-900 text-[11px] font-bold inline-flex items-center gap-1">
+                  <span>Abrir ↗</span>
+                </a>
+              ` : '-'}
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function recordManualTradeModal(marketSlug, outcome, price, title, url) {
+      const amountPrompt = prompt(`Qual valor (USD) você apostou em "${outcome}" no mercado:\n${title}?`, "5.00");
+      if (amountPrompt === null) return;
+      const amount = parseFloat(amountPrompt);
+      if (isNaN(amount) || amount <= 0) {
+        showToast('Valor Inválido', 'Digite um valor numérico positivo em USD.', 'error');
+        return;
+      }
+
+      showToast('Gravando', `Registrando aposta real de $${amount.toFixed(2)} em ${outcome}...`, 'info');
+      try {
+        const res = await fetch('/api/sports/manual-trade', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            market_slug: marketSlug,
+            outcome: outcome,
+            price: price,
+            amount_usd: amount,
+            market_title: title,
+            event_url: url,
+            mode: 'live'
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast('Aposta Real Registrada', data.message || 'Trade adicionado ao portfólio real!', 'success');
+          refreshAllData();
+        } else {
+          showToast('Erro', data.error || 'Falha ao registrar aposta.', 'error');
+        }
+      } catch (err) {
+        showToast('Erro', 'Falha na requisição: ' + err.message, 'error');
+      }
+    }
+
+    async function simulatePaperTrade(marketSlug, outcome, price, title, url) {
+      showToast('Simulação', `Simulando compra de $5.00 em ${outcome}...`, 'info');
+      try {
+        const resTrade = await fetch('/api/sports/manual-trade', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            market_slug: marketSlug,
+            outcome: outcome,
+            price: price,
+            amount_usd: 5.0,
+            market_title: title,
+            event_url: url,
+            mode: 'paper'
+          })
+        });
+        const data = await resTrade.json();
+        if (data.success) {
+          showToast('Simulação Registrada', `Compra simulada de $5.00 em ${outcome} adicionada ao portfólio fake!`, 'success');
+          refreshAllData();
+        } else {
+          showToast('Erro', data.error || 'Falha ao simular compra.', 'error');
+        }
+      } catch (err) {
+        showToast('Erro', err.message, 'error');
+      }
+    }
+
     // Tab switcher
     function switchTab(tabId) {
-      ['trades', 'positions', 'traders', 'settings'].forEach(t => {
+      ['sports', 'trades', 'positions', 'traders', 'settings'].forEach(t => {
         const content = document.getElementById(`tab-content-${t}`);
         const btn = document.getElementById(`tab-btn-${t}`);
+        if (!content || !btn) return;
         if (t === tabId) {
           content.classList.remove('hidden');
-          btn.className = 'pb-3 tab-active flex items-center gap-2';
+          btn.className = 'pb-3 tab-active flex items-center gap-2 font-bold text-emerald-400';
         } else {
           content.classList.add('hidden');
           btn.className = 'pb-3 text-gray-400 hover:text-gray-200 flex items-center gap-2';
@@ -1708,6 +2228,7 @@ DASHBOARD_HTML = """
       saveBtn.innerHTML = '<span>Salvando...</span>';
 
       const payload = {
+        user_wallet_address: (document.getElementById('cfg-wallet-address') ? document.getElementById('cfg-wallet-address').value : '').trim(),
         fixed_amount_usd: parseFloat(document.getElementById('cfg-fixed-usd').value),
         daily_budget_usd: parseFloat(document.getElementById('cfg-daily-budget').value),
         max_per_market_usd: parseFloat(document.getElementById('cfg-max-market').value),
@@ -1728,7 +2249,7 @@ DASHBOARD_HTML = """
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        showToast('⚙️ Configurações Salvas', 'Limites de risco, Take-Profit e Stop-Loss atualizados com sucesso.', 'success');
+        showToast('⚙️ Configurações Salvas', 'Limites de risco, endereço e saldos atualizados com sucesso.', 'success');
       } catch (err) {
         showToast('Erro', 'Falha ao salvar configurações: ' + err.message, 'error');
       } finally {
@@ -1768,6 +2289,18 @@ DASHBOARD_HTML = """
         const res = await fetch('/api/config');
         const data = await res.json();
         if (data) {
+          if (document.getElementById('cfg-wallet-address') && data.user_wallet_address !== undefined) document.getElementById('cfg-wallet-address').value = data.user_wallet_address;
+          const walletHeaderSpan = document.getElementById('header-wallet-address');
+          if (walletHeaderSpan) {
+            const a = (data.user_wallet_address || '').trim();
+            if (a) {
+              walletHeaderSpan.innerText = a.length > 10 ? `${a.substring(0, 6)}...${a.substring(a.length - 4)}` : a;
+              walletHeaderSpan.title = a;
+            } else {
+              walletHeaderSpan.innerText = 'Manual (Navegador)';
+              walletHeaderSpan.title = 'Modo de registro manual na Polymarket';
+            }
+          }
           if (document.getElementById('cfg-fixed-usd') && data.fixed_amount_usd !== undefined) document.getElementById('cfg-fixed-usd').value = data.fixed_amount_usd;
           if (document.getElementById('cfg-daily-budget') && data.daily_budget_usd !== undefined) document.getElementById('cfg-daily-budget').value = data.daily_budget_usd;
           if (document.getElementById('cfg-max-market') && data.max_per_market_usd !== undefined) document.getElementById('cfg-max-market').value = data.max_per_market_usd;
@@ -1786,39 +2319,41 @@ DASHBOARD_HTML = """
       }
     }
 
-    // Sincronizar Saldo On-chain da Carteira Real via Bullpen
+    // Sincronizar Posições e Carteira diretamente da API Pública da Polymarket
     async function syncWalletBalance() {
-      showToast('Carteira', 'Consultando saldo on-chain na rede Polygon...', 'info');
+      let addrInput = document.getElementById('cfg-wallet-address');
+      let addr = addrInput ? addrInput.value.trim() : '';
+
+      if (!addr) {
+        const promptAddr = prompt('Digite seu endereço público de carteira/proxy na Polymarket (0x...):', '');
+        if (promptAddr && promptAddr.trim()) {
+          addr = promptAddr.trim();
+          if (addrInput) addrInput.value = addr;
+          // Save immediately
+          await fetch('/api/config/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_wallet_address: addr })
+          });
+        }
+      }
+
+      showToast('Polymarket', 'Consultando posições abertas na API pública da Polymarket...', 'info');
       try {
-        const res = await fetch('/api/wallet/sync', { method: 'POST' });
+        const res = await fetch('/api/wallet/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ address: addr || null })
+        });
         const data = await res.json();
         if (data.success) {
-          showToast('Saldo Atualizado', `Saldo da carteira real: $${data.balance_usd.toFixed(2)} (Polygon)`, 'success');
-          const cfgLive = document.getElementById('cfg-live-cash');
-          if (cfgLive) cfgLive.value = data.balance_usd;
+          showToast('Polymarket Sincronizada', data.message || 'Carteira sincronizada com sucesso!', 'success');
           refreshAllData();
         } else {
-          showToast('Aviso', data.error || 'Não foi possível ler o saldo da carteira', 'warning');
+          showToast('Aviso', data.error || 'Não foi possível consultar a carteira', 'warning');
         }
       } catch (err) {
-        showToast('Erro', 'Falha ao sincronizar carteira: ' + err.message, 'error');
-      }
-    }
-
-    // Reautenticar e Resetar Chave API Polymarket CLOB
-    async function reauthClobKey() {
-      showToast('Autenticação CLOB', 'Reautenticando e gerando nova chave de API do Polymarket...', 'info');
-      try {
-        const res = await fetch('/api/wallet/reauth', { method: 'POST' });
-        const data = await res.json();
-        if (data.success) {
-          showToast('CLOB Reautenticado', 'Chave de API do Polymarket CLOB ativa e renovada com sucesso!', 'success');
-          syncWalletBalance();
-        } else {
-          showToast('Erro de Autenticação', data.error || 'Falha ao renovar chave CLOB', 'error');
-        }
-      } catch (err) {
-        showToast('Erro', 'Falha ao reautenticar chave CLOB: ' + err.message, 'error');
+        showToast('Erro', 'Falha ao sincronizar: ' + err.message, 'error');
       }
     }
 
@@ -1953,7 +2488,9 @@ DASHBOARD_HTML = """
         const price = (b_exec.price || m_trade.price || 0.5).toFixed(3);
         const reasonStr = b_exec.reason || t.error || '-';
         const marketSlug = market.slug || '';
-        const marketUrl = market.url || (marketSlug ? `https://polymarket.com/event/${marketSlug}` : '');
+        const eventSlug = market.event_slug || '';
+        const targetSlug = eventSlug || marketSlug;
+        const marketUrl = market.url || (targetSlug ? `https://polymarket.com/event/${targetSlug}` : '');
 
         return `
           <tr class="hover:bg-gray-900/50 transition">
@@ -2001,7 +2538,7 @@ DASHBOARD_HTML = """
         tbody.innerHTML = keys.map(k => {
           const p = positions[k];
           const val = (p.shares || 0) * (p.avg_price || 0.5);
-          const pSlug = p.market_slug || k.split(':')[0] || '';
+          const pSlug = p.event_slug || p.market_slug || k.split(':')[0] || '';
           const pUrl = p.market_url || (pSlug ? `https://polymarket.com/event/${pSlug}` : '');
 
           return `
@@ -2389,6 +2926,13 @@ DASHBOARD_HTML = """
         console.error('Error loading positions:', err);
       }
 
+      // 5. Fetch Live Sports Signals
+      try {
+        await loadSportsSignals();
+      } catch (err) {
+        console.error('Error loading sports signals:', err);
+      }
+
       safeCreateIcons();
     }
 
@@ -2419,6 +2963,7 @@ DASHBOARD_HTML = """
       initChart();
       loadTraders();
       loadSettings();
+      loadSportsSignals();
       refreshAllData();
       safeCreateIcons();
       // Auto refresh data every 2.0 seconds

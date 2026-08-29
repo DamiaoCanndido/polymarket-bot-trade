@@ -9,11 +9,13 @@ import uuid
 import logging
 import traceback
 from datetime import datetime
+import concurrent.futures
 from typing import Dict, Any, List, Set, Optional
 
 from config import BotConfig, MasterTrader
 from risk_manager import RiskManager
 from executor import CopyExecutor
+from scanner import SportsMarketScanner
 
 logger = logging.getLogger("CopyTracker")
 
@@ -23,10 +25,13 @@ class CopyTracker:
         self.config = config
         self.executor = executor
         self.risk_manager = risk_manager
+        self.sports_scanner = SportsMarketScanner(getattr(config, "sports", None))
 
         self.trades_log_file = config.trades_log_file
+        self.signals_log_file = getattr(config, "signals_log_file", os.path.join(os.path.dirname(__file__), "signals_log.jsonl"))
         self.portfolio_state_file = config.portfolio_state_file
         self.processed_trade_ids: Set[str] = set()
+        self.dispatched_signal_ids: Set[str] = set()
 
         # Track master trader holdings separately for paper and live modes:
         # mode -> master_address -> { market_slug:outcome -> shares_held }
@@ -191,22 +196,30 @@ class CopyTracker:
 
     def seed_historical_trades(self) -> None:
         """
-        Seeds current feed trade IDs on bot startup so only subsequent new trades are executed.
+        Seeds current feed trade IDs on bot startup in parallel so only subsequent new trades are executed.
         """
-        logger.info("Seeding historical trades to ensure only new trades are mirrored...")
+        logger.info("Seeding historical trades in parallel...")
         seeded_count = 0
-        for trader in self.config.traders:
-            if not trader.enabled:
-                continue
+        enabled_traders = [t for t in self.config.traders if t.enabled]
+
+        def fetch_for_trader(t):
             try:
-                trades = self.executor.fetch_master_feed(address=trader.address, limit=20)
-                for tr in trades:
-                    tid = tr.get("trade_id") or tr.get("id")
-                    if tid:
-                        self.processed_trade_ids.add(str(tid))
-                        seeded_count += 1
-            except Exception as e:
-                logger.warning(f"Could not seed feed for trader {trader.name}: {e}")
+                return self.executor.fetch_master_feed(address=t.address, limit=15)
+            except Exception:
+                return []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, len(enabled_traders) or 1)) as pool:
+            future_to_trader = {pool.submit(fetch_for_trader, t): t for t in enabled_traders}
+            for fut in concurrent.futures.as_completed(future_to_trader):
+                try:
+                    trades = fut.result()
+                    for tr in trades:
+                        tid = tr.get("trade_id") or tr.get("id")
+                        if tid:
+                            self.processed_trade_ids.add(str(tid))
+                            seeded_count += 1
+                except Exception:
+                    pass
 
         logger.info(f"Seeded {seeded_count} prior trades as already processed.")
 
@@ -214,8 +227,9 @@ class CopyTracker:
         """
         Extracts standardized trade fields: market slug, outcome, amount, price, side, etc.
         """
-        market_slug = trade.get("market_slug") or trade.get("event_slug") or ""
-        market_title = trade.get("market_title") or trade.get("event_name") or market_slug
+        event_slug = trade.get("event_slug") or trade.get("eventSlug") or ""
+        market_slug = trade.get("market_slug") or trade.get("slug") or event_slug or ""
+        market_title = trade.get("market_title") or trade.get("title") or trade.get("event_name") or market_slug
         outcome = trade.get("outcome") or trade.get("asset") or "Yes"
         side = (trade.get("side") or "BUY").upper()
         
@@ -234,11 +248,13 @@ class CopyTracker:
         tx_hash = trade.get("transaction_hash") or ""
         trade_time = trade.get("timestamp") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        market_url = f"https://polymarket.com/event/{market_slug}" if market_slug else ""
+        target_slug = event_slug or market_slug
+        market_url = trade.get("market_url") or trade.get("event_url") or (f"https://polymarket.com/event/{target_slug}" if target_slug else "")
 
         return {
             "trade_id": str(trade_id),
             "transaction_hash": str(tx_hash),
+            "event_slug": event_slug,
             "market_slug": market_slug,
             "market_title": market_title,
             "market_url": market_url,
@@ -272,7 +288,7 @@ class CopyTracker:
         mode_port = self.portfolio[mode]
         master_pos_map = self.master_positions[mode]
 
-        market_slug = extracted["market_slug"]
+        event_slug = extracted.get("event_slug") or market_slug
         market_title = extracted["market_title"]
         market_url = extracted["market_url"]
         outcome = extracted["outcome"]
@@ -305,6 +321,7 @@ class CopyTracker:
             },
             "market": {
                 "slug": market_slug,
+                "event_slug": event_slug,
                 "title": market_title,
                 "url": market_url,
                 "outcome": outcome
@@ -387,6 +404,7 @@ class CopyTracker:
                     mode_port["cash_usd"] -= approved_usd
                     pos = mode_port["positions"].get(pos_key, {
                         "market_slug": market_slug,
+                        "event_slug": event_slug,
                         "market_title": market_title,
                         "market_url": market_url,
                         "outcome": outcome,
@@ -395,6 +413,7 @@ class CopyTracker:
                         "avg_price": price
                     })
                     pos["market_url"] = market_url
+                    pos["event_slug"] = event_slug
                     pos["shares"] += bot_shares
                     pos["total_cost"] += approved_usd
                     pos["avg_price"] = pos["total_cost"] / pos["shares"] if pos["shares"] > 0 else price
@@ -415,7 +434,9 @@ class CopyTracker:
                         market_slug=market_slug,
                         outcome=outcome,
                         amount_usd=approved_usd,
-                        max_price=max_allowed_price
+                        max_price=max_allowed_price,
+                        event_slug=event_slug,
+                        event_url=market_url
                     )
                     if not res.get("success"):
                         raise RuntimeError(f"Bullpen buy order failed: {res.get('error')}")
@@ -424,6 +445,7 @@ class CopyTracker:
                     mode_port["cash_usd"] -= approved_usd
                     pos = mode_port["positions"].get(pos_key, {
                         "market_slug": market_slug,
+                        "event_slug": event_slug,
                         "market_title": market_title,
                         "market_url": market_url,
                         "outcome": outcome,
@@ -432,6 +454,7 @@ class CopyTracker:
                         "avg_price": price
                     })
                     pos["market_url"] = market_url
+                    pos["event_slug"] = event_slug
                     pos["shares"] += bot_shares
                     pos["total_cost"] += approved_usd
                     pos["avg_price"] = pos["total_cost"] / pos["shares"] if pos["shares"] > 0 else price
@@ -522,7 +545,9 @@ class CopyTracker:
                         outcome=outcome,
                         shares=shares_to_sell,
                         sell_all=(proportional_fraction >= 0.99),
-                        min_price=min_allowed_price
+                        min_price=min_allowed_price,
+                        event_slug=event_slug,
+                        event_url=market_url
                     )
                     if not res.get("success"):
                         raise RuntimeError(f"Bullpen sell order failed: {res.get('error')}")
@@ -997,10 +1022,152 @@ class CopyTracker:
             "gross_usd_value": gross_usd_value
         }
 
+    def record_manual_trade(
+        self,
+        market_slug: str,
+        outcome: str,
+        price: float,
+        amount_usd: float,
+        market_title: str = "",
+        event_url: str = "",
+        mode: str = "live"
+    ) -> Dict[str, Any]:
+        """
+        Records a manual trade (either real live bet or simulated paper bet).
+        Updates the respective portfolio state and logs the trade record.
+        """
+        if amount_usd <= 0 or price <= 0:
+            return {"success": False, "error": "Valor ou preço inválido."}
+
+        exec_mode = "paper" if mode == "paper" else "live"
+        mode_port = self.portfolio.get(
+            exec_mode,
+            self._default_mode_state(
+                self.config.paper_initial_cash_usd if exec_mode == "paper" else self.config.live_initial_cash_usd
+            )
+        )
+        shares = round(amount_usd / price, 2)
+        pos_key = f"{market_slug}:{outcome}"
+
+        # Deduct or adjust cash
+        if exec_mode == "paper":
+            mode_port["cash_usd"] = mode_port.get("cash_usd", 1000.0) - amount_usd
+        else:
+            mode_port["cash_usd"] = max(0.0, mode_port.get("cash_usd", 0.0) - amount_usd)
+
+        mode_port["total_trades_count"] = mode_port.get("total_trades_count", 0) + 1
+        mode_port["successful_trades"] = mode_port.get("successful_trades", 0) + 1
+
+        # Add / update position
+        positions = mode_port.setdefault("positions", {})
+        if pos_key in positions:
+            existing = positions[pos_key]
+            old_shares = float(existing.get("shares", 0.0))
+            old_cost = float(existing.get("total_cost", 0.0))
+            new_shares = old_shares + shares
+            new_cost = old_cost + amount_usd
+            new_avg_price = new_cost / new_shares if new_shares > 0 else price
+            positions[pos_key] = {
+                "market_slug": market_slug,
+                "market_title": market_title or existing.get("market_title", market_slug),
+                "market_url": event_url or existing.get("market_url", f"https://polymarket.com/event/{market_slug}"),
+                "outcome": outcome,
+                "shares": round(new_shares, 2),
+                "total_cost": round(new_cost, 2),
+                "avg_price": round(new_avg_price, 4),
+                "last_price": round(price, 4)
+            }
+        else:
+            positions[pos_key] = {
+                "market_slug": market_slug,
+                "market_title": market_title or market_slug,
+                "market_url": event_url or f"https://polymarket.com/event/{market_slug}",
+                "outcome": outcome,
+                "shares": shares,
+                "total_cost": round(amount_usd, 2),
+                "avg_price": round(price, 4),
+                "last_price": round(price, 4)
+            }
+
+        event_id = str(uuid.uuid4())
+        timestamp_now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        mode_label = "Live" if exec_mode == "live" else "Paper"
+        trader_name = "Manual (Polymarket Web)" if exec_mode == "live" else "Simulação Manual (Paper)"
+
+        log_entry = {
+            "event_id": event_id,
+            "timestamp": timestamp_now,
+            "trade_id": f"manual_buy_{event_id[:8]}",
+            "transaction_hash": None,
+            "master_trader": {
+                "address": f"user_manual_{exec_mode}",
+                "name": trader_name,
+                "category": "Sports",
+                "risk_tier": "low",
+                "style": "manual"
+            },
+            "market": {
+                "slug": market_slug,
+                "title": market_title or market_slug,
+                "url": event_url or f"https://polymarket.com/event/{market_slug}",
+                "outcome": outcome
+            },
+            "master_trade": {
+                "side": "BUY",
+                "price": price,
+                "size_usd": amount_usd,
+                "shares": shares,
+                "timestamp": timestamp_now
+            },
+            "bot_execution": {
+                "action": "BUY",
+                "amount_usd": amount_usd,
+                "shares": shares,
+                "price": price,
+                "proportional_fraction": 1.0,
+                "mode": exec_mode,
+                "status": "EXECUTED",
+                "reason": f"👤 Aposta {mode_label.lower()} manual ({'registrada na Polymarket' if exec_mode == 'live' else 'simulada'}) (${amount_usd:.2f} @ ${price:.3f})."
+            },
+            "error": None,
+            "portfolio_metrics": self._get_portfolio_metrics(exec_mode)
+        }
+
+        self._log_trade_record(log_entry)
+        self._save_portfolio_state()
+
+        return {
+            "success": True,
+            "message": f"Aposta ({mode_label}) de ${amount_usd:.2f} em {outcome} registrada com sucesso!",
+            "details": log_entry
+        }
+
+    def record_manual_real_trade(
+        self,
+        market_slug: str,
+        outcome: str,
+        price: float,
+        amount_usd: float,
+        market_title: str = "",
+        event_url: str = ""
+    ) -> Dict[str, Any]:
+        """Backward compatibility wrapper for record_manual_trade with mode='live'."""
+        return self.record_manual_trade(
+            market_slug=market_slug,
+            outcome=outcome,
+            price=price,
+            amount_usd=amount_usd,
+            market_title=market_title,
+            event_url=event_url,
+            mode="live"
+        )
+
     def poll_cycle(self) -> List[Dict[str, Any]]:
         """
-        Runs a single poll cycle across all active master traders and checks auto take-profit and stop-loss.
-        Catches any feed or execution errors to ensure uninterrupted looping.
+        Runs a single poll cycle:
+        1. Scans sports markets for value signals.
+        2. Monitors master trader feeds.
+        3. Checks auto take-profit and stop-loss on open positions.
         """
         if not self._seeded:
             self.seed_historical_trades()
@@ -1008,33 +1175,73 @@ class CopyTracker:
 
         results = []
 
-        # 1. Process Master Trader Feeds
-        for trader in self.config.traders:
-            if not trader.enabled:
-                continue
-
+        # 1. Scan Sports Opportunities & Dispatch Signals
+        if getattr(self.config, "sports", None) and getattr(self.config.sports, "enabled", True):
             try:
-                trades = self.executor.fetch_master_feed(address=trader.address, limit=10)
+                sports_opps = self.sports_scanner.scan_sports_opportunities(limit_per_sport=5)
+                for opp in sports_opps[:8]:
+                    opp_id = opp["id"]
+                    if opp_id not in self.dispatched_signal_ids:
+                        self.dispatched_signal_ids.add(opp_id)
+                        # Dispatch formatted notification
+                        self.executor.dispatcher.dispatch_signal(opp)
+
+                        # If Paper Trading is active, enter simulated paper trade
+                        if self.config.dry_run:
+                            paper_port = self.portfolio.get("paper", {})
+                            market_slug = opp["market_slug"]
+                            outcome = opp["outcome"]
+                            price = opp["price"]
+                            amt = min(self.config.sizing.fixed_amount_usd, 10.0)
+
+                            if paper_port.get("cash_usd", 0.0) >= amt:
+                                pos_key = f"{market_slug}:{outcome}"
+                                if pos_key not in paper_port.get("positions", {}):
+                                    shares = round(amt / price, 2)
+                                    paper_port["cash_usd"] -= amt
+                                    paper_port["total_trades_count"] = paper_port.get("total_trades_count", 0) + 1
+                                    paper_port.setdefault("positions", {})[pos_key] = {
+                                        "market_slug": market_slug,
+                                        "market_title": opp["event_title"],
+                                        "market_url": opp["event_url"],
+                                        "outcome": outcome,
+                                        "shares": shares,
+                                        "total_cost": round(amt, 2),
+                                        "avg_price": price,
+                                        "last_price": price
+                                    }
+                                    self._save_portfolio_state()
+            except Exception as sports_err:
+                logger.error(f"Error scanning sports opportunities: {sports_err}")
+
+        # 2. Process Master Trader Feeds in Parallel
+        enabled_traders = [t for t in self.config.traders if t.enabled]
+
+        def fetch_and_process(trader):
+            trade_results = []
+            try:
+                trades = self.executor.fetch_master_feed(address=trader.address, limit=8)
                 for trade in trades:
                     try:
                         res = self.process_incoming_trade(trade, trader)
                         if res.get("status") in ("EXECUTED", "FAILED"):
-                            results.append(res)
+                            trade_results.append(res)
                     except Exception as trade_err:
                         logger.error(f"Unhandled error processing trade from {trader.name}: {trade_err}")
-                        self._log_trade_record({
-                            "event_id": str(uuid.uuid4()),
-                            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            "trade_id": str(trade.get("trade_id") or trade.get("id") or "unknown"),
-                            "master_trader": {"address": trader.address, "name": trader.name},
-                            "error": str(trade_err),
-                            "traceback": traceback.format_exc(),
-                            "status": "FAILED"
-                        })
             except Exception as feed_err:
                 logger.error(f"Error fetching trade feed for trader {trader.name} ({trader.address}): {feed_err}")
+            return trade_results
 
-        # 2. Check and Execute Auto Take-Profit on Profitable Open Positions
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(enabled_traders) or 1)) as pool:
+            future_to_trader = {pool.submit(fetch_and_process, t): t for t in enabled_traders}
+            for fut in concurrent.futures.as_completed(future_to_trader):
+                try:
+                    res_list = fut.result()
+                    results.extend(res_list)
+                except Exception:
+                    pass
+
+        # 3. Check and Execute Auto Take-Profit on Profitable Open Positions
         try:
             tp_results = self.check_auto_take_profit()
             for tp in tp_results:
@@ -1042,7 +1249,7 @@ class CopyTracker:
         except Exception as tp_err:
             logger.error(f"Error checking Auto Take-Profit: {tp_err}")
 
-        # 3. Check and Execute Auto Stop-Loss / Cleanup on Losing/Resolved Positions
+        # 4. Check and Execute Auto Stop-Loss / Cleanup on Losing/Resolved Positions
         try:
             sl_results = self.check_auto_stop_loss()
             for sl in sl_results:

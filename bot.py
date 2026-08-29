@@ -14,7 +14,7 @@ from rich.panel import Panel
 from rich.layout import Layout
 
 from config import load_config, save_config, BotConfig, MasterTrader
-from scanner import LeaderboardScanner
+from scanner import LeaderboardScanner, SportsMarketScanner
 from risk_manager import RiskManager
 from executor import CopyExecutor
 from tracker import CopyTracker
@@ -24,12 +24,46 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 
 def print_banner(mode: str = "Paper Trading"):
-    title = f"[bold cyan]POLYMARKET COPYTRADING BOT[/bold cyan] [yellow]({mode})[/yellow]"
+    title = f"[bold cyan]POLYMARKET SPORTS SIGNALS & TRADING BOT[/bold cyan] [yellow]({mode})[/yellow]"
     console.print(Panel.fit(title, border_style="cyan"))
 
 
+def cmd_sports(args, config: BotConfig):
+    console.print("[bold green]Scanning Polymarket for active sports events and odds...[/bold green]")
+    scanner = SportsMarketScanner(config.sports)
+    opps = scanner.scan_sports_opportunities(limit_per_sport=args.limit)
+
+    if not opps:
+        console.print("[yellow]No sports opportunities found matching criteria.[/yellow]")
+        return
+
+    table = Table(title="Live Sports Opportunities & Signals", border_style="green")
+    table.add_column("Modalidade", style="bold cyan")
+    table.add_column("Evento / Partida", style="bold white")
+    table.add_column("Seleção", style="bold yellow")
+    table.add_column("Odd / Preço", justify="right", style="magenta")
+    table.add_column("Volume 24h", justify="right", style="green")
+    table.add_column("Liquidez", justify="right", style="blue")
+    table.add_column("Confiança", style="white")
+    table.add_column("Link Direto", style="dim underline")
+
+    for o in opps[:args.top]:
+        table.add_row(
+            o["sport_label"],
+            o["event_title"][:40],
+            o["outcome"],
+            f"${o['price']:.2f} ({o['odds_pct']})",
+            f"${o['volume_24h_usd']:,.0f}",
+            f"${o['liquidity_usd']:,.0f}",
+            o["confidence"],
+            o["event_url"]
+        )
+
+    console.print(table)
+
+
 def cmd_scan(args, config: BotConfig):
-    console.print(f"[bold green]Scanning Polymarket Leaderboard ({args.period}) for top balanced master traders...[/bold green]")
+    console.print(f"[bold green]Scanning Polymarket Leaderboard ({args.period}) for top sports / master traders...[/bold green]")
     scanner = LeaderboardScanner(bullpen_path=config.bullpen_path)
     traders = scanner.fetch_top_traders(
         time_period=args.period,
@@ -184,7 +218,7 @@ def cmd_portfolio(args, config: BotConfig):
         table.add_column("Custo Total", justify="right", style="green")
 
         for key, pos in positions.items():
-            p_slug = pos.get("market_slug", key.split(":")[0])
+            p_slug = pos.get("event_slug") or pos.get("market_slug", key.split(":")[0])
             p_url = pos.get("market_url") or (f"https://polymarket.com/event/{p_slug}" if p_slug else "-")
             table.add_row(
                 p_url,
@@ -247,7 +281,7 @@ def cmd_logs(args, config: BotConfig):
         status_color = "green" if status == "EXECUTED" else ("yellow" if status in ("SKIPPED", "REJECTED_BY_RISK") else "red")
         status_str = f"[{status_color}]{status}[/{status_color}]"
 
-        m_slug = market.get("slug", "")
+        m_slug = market.get("event_slug") or market.get("slug", "")
         m_url = market.get("url") or (f"https://polymarket.com/event/{m_slug}" if m_slug else "-")
 
         table.add_row(
@@ -320,7 +354,7 @@ def cmd_start(args, config: BotConfig):
                     b_exec = details.get("bot_execution", {})
                     master = details.get("master_trader", {})
 
-                    m_slug = market.get("slug", "")
+                    m_slug = market.get("event_slug") or market.get("slug", "")
                     m_url = market.get("url") or (f"https://polymarket.com/event/{m_slug}" if m_slug else "")
 
                     status = b_exec.get("status", "EXECUTED")
@@ -409,6 +443,11 @@ def main():
     parser = argparse.ArgumentParser(description="Polymarket Copytrading Bot")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
 
+    # sports
+    p_sports = subparsers.add_parser("sports", help="Scan active sports events, matches, and odds on Polymarket")
+    p_sports.add_argument("--limit", type=int, default=10, help="Limit per sport category")
+    p_sports.add_argument("--top", type=int, default=20, help="Top sports signals to show")
+
     # scan
     p_scan = subparsers.add_parser("scan", help="Scan leaderboard for top master traders")
     p_scan.add_argument("--period", default="7d", choices=["1d", "7d", "30d", "all"], help="Time period")
@@ -457,7 +496,9 @@ def main():
     args = parser.parse_args()
     config = load_config()
 
-    if args.command == "scan":
+    if args.command == "sports":
+        cmd_sports(args, config)
+    elif args.command == "scan":
         cmd_scan(args, config)
     elif args.command == "status":
         cmd_status(args, config)
